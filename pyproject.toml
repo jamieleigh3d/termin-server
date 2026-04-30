@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termin-server"
+version = "0.9.0"
+description = "Termin reference server — FastAPI hosting layer + IO-bound builtins (sqlite storage, Anthropic compute, Tailwind SSR) layered on termin-core."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Jamie-Leigh Blake" },
+]
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Server",
+    "Framework :: FastAPI",
+]
+# termin-server is the *reference* hosting layer: FastAPI app factory,
+# IO-bound builtin providers, static assets. Alternate runtimes
+# implementing termin-core directly do NOT depend on termin-server;
+# they supply their own framework adapter and their own provider
+# implementations.
+dependencies = [
+    "termin-core>=0.9.0,<0.10",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "aiosqlite>=0.19.0",
+    "jinja2>=3.0",
+    "pyyaml>=6.0",
+    "websockets>=12.0",
+    "httpx>=0.24",
+    "anthropic>=0.18",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["termin_server*"]
+
+[tool.setuptools.package-data]
+termin_server = [
+    "py.typed",
+    "static/*",
+    "static/**/*",
+    "templates/*",
+    "templates/**/*",
+]
+
+# v0.9 Phase 5b.3: register the first-party tailwind-default SSR
+# presentation provider via the same `termin.providers` entry-point
+# group external providers (e.g. termin-spectrum-provider) use. The
+# app's _discover_external_providers reads this at startup. Tailwind
+# is also registered as a built-in via register_builtins; the
+# registry's register() is overwrite-safe, so the double registration
+# is harmless. Splitting it this way means a future operator who
+# installs an alternative Tailwind plug-in can set the deploy config
+# to bind that product instead, exercising the same pluggability
+# surface Spectrum uses. Slice 7.3 moved this entry point here from
+# termin-compiler/setup.py.
+[project.entry-points."termin.providers"]
+tailwind-default = "termin_server.providers.builtins.presentation_tailwind_default:register_tailwind_default"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
