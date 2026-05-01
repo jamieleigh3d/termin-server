@@ -18,11 +18,12 @@ role-to-scope mapping.
 Per BRD §6.1, Anonymous bypasses the provider entirely — no
 credentials in the request means no provider call.
 
-The returned User dict shape is unchanged from v0.8 so existing
-templates and CEL expressions (User.Name, User.Authenticated,
-User.Scopes, etc.) continue to work without modification. The dict
-also carries the new "Principal" key (the typed Principal object)
-for code that wants to consume the contract directly.
+v0.9 retired the legacy `User.PascalCase` CEL surface; source-level
+references should use `the user.display_name`, `the user.scopes`,
+`not the user.is_anonymous`, etc. The compiler emits TERMIN-S014
+on legacy `User.X` use with a per-leaf fix-it. The runtime still
+exposes the typed `Principal` object on `the user` per BRD #3 §4.2
+for code that consumes the contract directly.
 """
 
 from dataclasses import replace
