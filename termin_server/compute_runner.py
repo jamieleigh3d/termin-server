@@ -317,21 +317,126 @@ def _build_agent_audit_metadata(
 
 
 async def execute_compute(ctx: RuntimeContext, comp: dict, record: dict,
-                          content_name: str, main_loop=None):
-    """Execute a Compute triggered by an event."""
+                          content_name: str, main_loop=None,
+                          invoked_by=None):
+    """Execute a Compute triggered by an event or manual /trigger call.
+
+    ``invoked_by`` is the upstream Principal who caused this run. For
+    manual ``POST /api/v1/compute/<name>/trigger`` calls it's the
+    HTTP caller's resolved principal; for event-triggered runs it's
+    the principal who caused the upstream event (or None if the
+    event chain doesn't carry one — system-triggered, scheduler).
+    Threaded through to ``write_audit_trace`` so the audit row
+    stamps the right principal columns per BRD §6.3.4.
+    """
     comp_name = comp["name"]["display"]
     provider = comp.get("provider", "cel")
 
     if provider == "llm":
-        await _execute_llm_compute(ctx, comp, record, content_name, main_loop)
+        await _execute_llm_compute(
+            ctx, comp, record, content_name, main_loop,
+            invoked_by=invoked_by,
+        )
     elif provider == "ai-agent":
-        await _execute_agent_compute(ctx, comp, record, content_name, main_loop)
+        await _execute_agent_compute(
+            ctx, comp, record, content_name, main_loop,
+            invoked_by=invoked_by,
+        )
+    elif provider in (None, "", "cel", "default-CEL"):
+        # v0.9.1: default-CEL via /trigger now writes an audit row.
+        # Previously this branch only printed a warning, leaving the
+        # spec §5.2 "manual trigger writes audit" requirement
+        # unsatisfied. The synchronous endpoint at
+        # /api/v1/compute/<name>/ has its own audit path; this
+        # branch is the manual-trigger path for CEL computes.
+        await _execute_cel_compute(
+            ctx, comp, record, content_name,
+            invoked_by=invoked_by,
+        )
     else:
-        print(f"[Termin] Compute '{comp_name}': provider '{provider}' not supported for event triggers")
+        print(
+            f"[Termin] Compute '{comp_name}': unknown provider "
+            f"'{provider}' — skipping"
+        )
+
+
+async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
+                                content_name: str, invoked_by=None):
+    """Execute a default-CEL Compute — evaluate the CEL body and
+    write an audit row.
+
+    Slimmer than the synchronous /api/v1/compute/<name>/ endpoint:
+    no preconditions, no postconditions, no transaction
+    machinery — manual trigger + event paths use this for the
+    audit-only contract per BRD §6.3.4. The full sync endpoint
+    remains the right path for callers that need the result back.
+    """
+    comp_name = comp["name"]["display"]
+    invocation_id = str(uuid.uuid4())
+    started = _dt.datetime.utcnow()
+    started_str = started.isoformat() + "Z"
+
+    body_lines = comp.get("body_lines", [])
+    if not body_lines:
+        # No CEL body to evaluate — record the invocation as
+        # success but leave trace empty.
+        completed = _dt.datetime.utcnow()
+        await write_audit_trace(
+            ctx, comp, invocation_id=invocation_id, trigger="manual",
+            started_at=started_str,
+            completed_at=completed.isoformat() + "Z",
+            latency_ms=(completed - started).total_seconds() * 1000.0,
+            outcome="success",
+            trace_data={"compute_type": "cel", "note": "no body"},
+            invoked_by=invoked_by,
+        )
+        return
+
+    cel_body = body_lines[0]
+    eval_ctx = {
+        "Compute": {
+            "Name": comp_name,
+            "Provider": "cel",
+            "IdentityMode": comp.get("identity_mode", "delegate"),
+            "Trigger": "manual",
+            "ExecutionId": invocation_id,
+            "StartedAt": started_str,
+        },
+    }
+    if isinstance(record, dict):
+        eval_ctx.update(record)
+        if content_name:
+            eval_ctx[content_name] = record
+
+    try:
+        ctx.expr_eval.evaluate(cel_body, eval_ctx)
+        completed = _dt.datetime.utcnow()
+        await write_audit_trace(
+            ctx, comp, invocation_id=invocation_id, trigger="manual",
+            started_at=started_str,
+            completed_at=completed.isoformat() + "Z",
+            latency_ms=(completed - started).total_seconds() * 1000.0,
+            outcome="success",
+            trace_data={"compute_type": "cel", "cel": cel_body},
+            invoked_by=invoked_by,
+        )
+    except Exception as e:
+        completed = _dt.datetime.utcnow()
+        await write_audit_trace(
+            ctx, comp, invocation_id=invocation_id, trigger="manual",
+            started_at=started_str,
+            completed_at=completed.isoformat() + "Z",
+            latency_ms=(completed - started).total_seconds() * 1000.0,
+            outcome="error",
+            error_message=str(e),
+            trace_data={"compute_type": "cel", "cel": cel_body, "error": str(e)},
+            invoked_by=invoked_by,
+        )
 
 
 async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
-                                content_name: str, main_loop=None):
+                                content_name: str, main_loop=None,
+                                invoked_by=None):
     """Execute a Level 1 LLM Compute — field-to-field completion."""
     comp_name = comp["name"]["display"]
     comp_snake = comp["name"]["snake"]
@@ -488,6 +593,7 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
             latency_ms=_llm_duration, outcome="success",
             trace_data=trace_data,
             audit_metadata=audit_metadata,
+            invoked_by=invoked_by,
         )
     except AIProviderError as e:
         print(f"[Termin] [ERROR] Compute '{comp_name}': {e}")
@@ -504,11 +610,13 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
             error_message=str(e),
             trace_data={"compute_type": "agent", "error": str(e)},
             audit_metadata=audit_metadata,
+            invoked_by=invoked_by,
         )
 
 
 async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
-                                  content_name: str, main_loop=None):
+                                  content_name: str, main_loop=None,
+                                  invoked_by=None):
     """Execute a Level 3 Agent Compute — autonomous with tool calls."""
     comp_name = comp["name"]["display"]
     comp_snake = comp["name"]["snake"]
@@ -770,6 +878,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                     "reason": refusal_state["reason"],
                 },
                 audit_metadata=agent_audit_metadata,
+                invoked_by=invoked_by,
             )
             # Refusal event for downstream subscribers (UI surfacing,
             # ops alerts, etc.).
@@ -801,6 +910,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
             latency_ms=_agent_duration, outcome="success",
             trace_data=trace_data,
             audit_metadata=agent_audit_metadata,
+            invoked_by=invoked_by,
         )
     except AIProviderError as e:
         print(f"[Termin] [ERROR] Compute '{comp_name}': {e}")
@@ -817,6 +927,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
             error_message=str(e),
             trace_data={"compute_type": "agent", "error": str(e)},
             audit_metadata=agent_audit_metadata,
+            invoked_by=invoked_by,
         )
 
 
@@ -857,15 +968,49 @@ async def write_audit_trace(ctx: RuntimeContext, comp: dict, invocation_id: str,
         return
 
     # Per BRD §6.3.4, principal info on the audit record.
+    # v0.9.1: anonymous principals get a synthesized
+    # ``anonymous:<short>`` id rather than empty-string so audit
+    # rows always carry a "proper auditable type" — operators can
+    # filter ``invoked_by_principal_id LIKE 'anonymous:%'`` to
+    # find anonymous-caller rows. The short suffix is derived
+    # from the invocation_id so each anonymous row is uniquely
+    # identifiable within the audit trail; the prefix preserves
+    # the type information operators care about.
     invoked_by_id = ""
     invoked_by_name = ""
     on_behalf_of_id = ""
+
+    def _synth_anon(raw_id: str) -> str:
+        """If the raw id marks an anonymous principal, decorate it
+        with the invocation_id short prefix; otherwise return as-is."""
+        if raw_id in ("", "anonymous", None):
+            short = (invocation_id or "").replace("-", "")[:8] or "unknown"
+            return f"anonymous:{short}"
+        return raw_id
+
     if invoked_by is not None:
-        invoked_by_id = getattr(invoked_by, "id", "") or ""
-        invoked_by_name = getattr(invoked_by, "display_name", "") or ""
+        raw_id = getattr(invoked_by, "id", "") or ""
+        invoked_by_id = _synth_anon(raw_id)
+        raw_name = getattr(invoked_by, "display_name", "") or ""
+        if not raw_name and invoked_by_id.startswith("anonymous:"):
+            invoked_by_name = "Anonymous"
+        else:
+            invoked_by_name = raw_name
+
+        # Per BRD §6.3.4: on_behalf_of is the *chain target* — only
+        # populated when the Principal carries an explicit
+        # ``on_behalf_of`` reference (delegate-mode agents
+        # constructed with the upstream user attached). For a
+        # principal acting as themselves (humans, anonymous, or
+        # service-mode agents) the column stays empty — the
+        # column's signal is precisely whether the row represents
+        # an X-acting-for-Y chain. This matches the v0.9.0
+        # ``test_v09_identity_contract.py::TestAuditLogPrincipalRecording``
+        # invariants.
         obo = getattr(invoked_by, "on_behalf_of", None)
         if obo is not None:
-            on_behalf_of_id = getattr(obo, "id", "") or ""
+            obo_raw = getattr(obo, "id", "") or ""
+            on_behalf_of_id = _synth_anon(obo_raw)
 
     trace_json = json.dumps(trace_data) if trace_data else "{}"
     record_data = {

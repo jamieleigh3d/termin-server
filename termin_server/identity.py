@@ -33,6 +33,7 @@ from fastapi import Request, HTTPException, WebSocket
 
 from .providers.identity_contract import (
     ANONYMOUS_PRINCIPAL, Principal, IdentityProvider,
+    make_anonymous_principal,
 )
 
 
@@ -213,7 +214,13 @@ def _resolve_principal_and_scopes(
     canonical_role = _resolve_role_key(roles_to_scopes, cookie_role)
     if canonical_role.lower() == "anonymous":
         scopes = list(roles_to_scopes.get(canonical_role, []))
-        return ANONYMOUS_PRINCIPAL, canonical_role, scopes
+        # v0.9.1: produce a session-bearing anonymous Principal when
+        # the request carries a session marker (the termin_user_name
+        # cookie). Audit rows then carry a typed
+        # ``invoked_by_principal_id = "anonymous:<marker>"`` rather
+        # than the bare sentinel id, so operators can distinguish
+        # different anonymous callers in audit logs.
+        return make_anonymous_principal(cookie_name), canonical_role, scopes
     user_name = cookie_name or "User"
     try:
         principal = identity_provider.authenticate({
@@ -224,10 +231,12 @@ def _resolve_principal_and_scopes(
     except Exception:
         # Fail-closed per BRD §6.1: provider failure → Anonymous.
         # Logging is the deploy operator's concern; runtime doesn't
-        # raise so the request proceeds with limited scopes.
+        # raise so the request proceeds with limited scopes. The
+        # synthesized anonymous principal still carries the session
+        # marker so audit rows are distinguishable.
         anon_key = _resolve_role_key(roles_to_scopes, "anonymous")
         scopes = list(roles_to_scopes.get(anon_key, []))
-        return ANONYMOUS_PRINCIPAL, anon_key, scopes
+        return make_anonymous_principal(cookie_name), anon_key, scopes
 
     # Effective scopes = union over all returned roles. Map provider
     # role names (which the stub gets from cookies, may be in any

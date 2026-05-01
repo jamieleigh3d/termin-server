@@ -791,13 +791,43 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
 
                     _main_loop = asyncio.get_event_loop()
 
+                    # v0.9.1: surface the upstream principal type for the
+                    # audit trail. For anonymous-only apps (the IR's
+                    # auth.roles list is exactly ["anonymous"], lowercase),
+                    # any caller IS anonymous by construction — pass the
+                    # ANONYMOUS_PRINCIPAL so write_audit_trace's synthesis
+                    # produces "anonymous:<short>" instead of empty string.
+                    # For multi-role apps the upstream principal isn't
+                    # currently carried across the event boundary; that's
+                    # a v0.10 plumbing job. Until then, multi-role event
+                    # paths get None (system-triggered shape) which is a
+                    # known weaker contract.
+                    auth_roles = [
+                        (r.get("name") or "").lower()
+                        for r in (ir.get("auth", {}) or {}).get("roles", [])
+                    ]
+                    _event_invoked_by = None
+                    if auth_roles == ["anonymous"]:
+                        from termin_core.providers.identity_contract import (
+                            make_anonymous_principal,
+                        )
+                        # No session marker available across the
+                        # event boundary in v0.9.x — falls back to
+                        # the canonical sentinel. v0.10 plumbs the
+                        # upstream session through the event record.
+                        _event_invoked_by = make_anonymous_principal()
+
                     def _run_compute(_comp=comp, _record=dict(record),
-                                     _content=content_name, _loop=_main_loop):
+                                     _content=content_name, _loop=_main_loop,
+                                     _invoked_by=_event_invoked_by):
                         import asyncio as _aio
                         bg_loop = _aio.new_event_loop()
                         try:
                             bg_loop.run_until_complete(
-                                execute_compute(ctx, _comp, _record, _content, _loop))
+                                execute_compute(
+                                    ctx, _comp, _record, _content, _loop,
+                                    invoked_by=_invoked_by,
+                                ))
                         except Exception as e:
                             print(f"[Termin] [ERROR] Compute '{_comp['name']['display']}' failed: {e}")
                         finally:
@@ -805,8 +835,8 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     threading.Thread(target=_run_compute, daemon=True).start()
 
     ctx.run_event_handlers = run_event_handlers
-    ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None: \
-        execute_compute(ctx, comp, record or {}, content_name, main_loop)
+    ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None, invoked_by=None: \
+        execute_compute(ctx, comp, record or {}, content_name, main_loop, invoked_by=invoked_by)
 
     # Content schemas for storage init
     schemas = list(ir.get("content", []))
