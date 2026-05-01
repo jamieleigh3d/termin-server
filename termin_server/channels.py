@@ -314,9 +314,33 @@ class ChannelDispatcher:
         except ChannelError:
             raise
         except Exception as e:
-            # Per BRD §6.4.5: default failure mode is log-and-drop
-            logger.warning(f"Channel '{display}' send failed ({contract}): {e}")
+            # Failure mode resolution per BRD §6.4.5:
+            #   log-and-drop (default) — log + return outcome=failed; never raise.
+            #   surface-as-error       — re-raise as ChannelError to the caller.
+            #   queue-and-retry        — grammar placeholder in v0.9.x; full
+            #                            implementation (exp backoff +
+            #                            dead-letter, max 24h) lands v0.10.
+            #                            v0.9.1 falls back to log-and-drop.
+            failure_mode = spec.get("failure_mode", "log-and-drop")
             self._metrics[display]["errors"] += 1
+            if failure_mode == "surface-as-error":
+                logger.warning(
+                    f"Channel '{display}' send failed ({contract}, "
+                    f"surface-as-error): {e}"
+                )
+                raise ChannelError(
+                    f"Channel '{display}' send failed: {e}"
+                ) from e
+            if failure_mode == "queue-and-retry":
+                logger.warning(
+                    f"Channel '{display}' send failed ({contract}, "
+                    f"queue-and-retry placeholder — falling back to "
+                    f"log-and-drop pending v0.10 worker): {e}"
+                )
+            else:
+                logger.warning(
+                    f"Channel '{display}' send failed ({contract}): {e}"
+                )
             return {"ok": False, "outcome": "failed", "channel": display}
 
     async def channel_send(self, channel_name: str, data: dict, user_scopes: set = None) -> dict:
