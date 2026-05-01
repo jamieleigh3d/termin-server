@@ -39,11 +39,46 @@ termin-conformance (spec + tests; runs against any termin-core-conforming
 
 ## Status
 
-`v0.9` (Phase 7 in flight). Slice 7.3 of Phase 7 (2026-04-30) extracted
-this package out of `termin-compiler/termin_runtime/`. The Python
-package import is `termin_server`; the legacy `termin_runtime` module
-in `termin-compiler` re-exports from this package as a back-compat
-shim and drops in slice 7.5.
+**v0.9.0 — released 2026-04-30.** Phase 7 of the v0.9 milestone
+extracted this package out of `termin-compiler/termin_runtime/`
+(slice 7.3) and dropped the back-compat shim layer in
+`termin-compiler` (slice 7.5a). `termin-compiler` now imports
+`from termin_server import create_termin_app` directly; alternate
+runtimes built on `termin-core` do not depend on `termin-server`.
+
+## Quick start
+
+```bash
+pip install termin-server termin-compiler
+
+# Compile a .termin source to a .termin.pkg
+termin compile examples/warehouse.termin
+
+# Serve the compiled package
+termin serve warehouse.termin.pkg --port 8000
+```
+
+Or programmatically:
+
+```python
+from termin_server import create_termin_app
+
+with open("warehouse.termin.pkg", "rb") as f:
+    # ... unpack the IR JSON from the .termin.pkg ZIP ...
+    app = create_termin_app(ir_json)
+
+# `app` is a FastAPI instance — serve via uvicorn or any ASGI server.
+```
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest tests/
+```
+
+24 own-repo tests across smoke, storage unit, and HTTP integration
+tiers — the layer below the [conformance suite](https://github.com/jamieleigh3d/termin-conformance).
 
 ## License
 
