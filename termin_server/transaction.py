@@ -26,7 +26,7 @@ Usage:
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class ContentSnapshot:
@@ -102,7 +102,7 @@ class Transaction:
                 check the staging area.
         """
         self.id = str(uuid.uuid4())
-        self.started_at = datetime.utcnow().isoformat() + "Z"
+        self.started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         self._storage_read = storage_read_fn
         self._journal: list[StagedWrite] = []
         self._staging: dict[tuple[str, any], dict] = {}  # (content, id) -> latest staged data

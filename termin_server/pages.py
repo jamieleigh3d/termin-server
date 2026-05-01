@@ -183,7 +183,7 @@ def _register_page_get(app, ctx, page, slug, page_reqs, page_templates,
             from termin_server.fastapi_adapter import make_auth_context
             cel_ctx = {
                 "the_user": build_the_user_for_cel(make_auth_context(user)),
-                "now": datetime.datetime.utcnow().isoformat() + "Z",
+                "now": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "today": datetime.date.today().isoformat(),
             }
 

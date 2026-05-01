@@ -18,7 +18,7 @@ event triggers, keeping a consistent execution path.
 
 import asyncio
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # Pattern: "schedule every <N> <unit>"
@@ -96,7 +96,7 @@ class Scheduler:
         try:
             while True:
                 await asyncio.sleep(interval)
-                ts = datetime.utcnow().isoformat() + "Z"
+                ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 print(f"[Termin] Scheduler: executing '{comp_name}' at {ts}")
                 try:
                     await self._execute_fn(comp, {}, "")

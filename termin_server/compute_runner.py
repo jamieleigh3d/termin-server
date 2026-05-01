@@ -373,18 +373,18 @@ async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
     """
     comp_name = comp["name"]["display"]
     invocation_id = str(uuid.uuid4())
-    started = _dt.datetime.utcnow()
-    started_str = started.isoformat() + "Z"
+    started = _dt.datetime.now(_dt.timezone.utc)
+    started_str = started.isoformat().replace("+00:00", "Z")
 
     body_lines = comp.get("body_lines", [])
     if not body_lines:
         # No CEL body to evaluate — record the invocation as
         # success but leave trace empty.
-        completed = _dt.datetime.utcnow()
+        completed = _dt.datetime.now(_dt.timezone.utc)
         await write_audit_trace(
             ctx, comp, invocation_id=invocation_id, trigger="manual",
             started_at=started_str,
-            completed_at=completed.isoformat() + "Z",
+            completed_at=completed.isoformat().replace("+00:00", "Z"),
             latency_ms=(completed - started).total_seconds() * 1000.0,
             outcome="success",
             trace_data={"compute_type": "cel", "note": "no body"},
@@ -410,22 +410,22 @@ async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
 
     try:
         ctx.expr_eval.evaluate(cel_body, eval_ctx)
-        completed = _dt.datetime.utcnow()
+        completed = _dt.datetime.now(_dt.timezone.utc)
         await write_audit_trace(
             ctx, comp, invocation_id=invocation_id, trigger="manual",
             started_at=started_str,
-            completed_at=completed.isoformat() + "Z",
+            completed_at=completed.isoformat().replace("+00:00", "Z"),
             latency_ms=(completed - started).total_seconds() * 1000.0,
             outcome="success",
             trace_data={"compute_type": "cel", "cel": cel_body},
             invoked_by=invoked_by,
         )
     except Exception as e:
-        completed = _dt.datetime.utcnow()
+        completed = _dt.datetime.now(_dt.timezone.utc)
         await write_audit_trace(
             ctx, comp, invocation_id=invocation_id, trigger="manual",
             started_at=started_str,
-            completed_at=completed.isoformat() + "Z",
+            completed_at=completed.isoformat().replace("+00:00", "Z"),
             latency_ms=(completed - started).total_seconds() * 1000.0,
             outcome="error",
             error_message=str(e),
@@ -440,7 +440,7 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
     """Execute a Level 1 LLM Compute — field-to-field completion."""
     comp_name = comp["name"]["display"]
     comp_snake = comp["name"]["snake"]
-    _llm_started = _dt.datetime.utcnow()
+    _llm_started = _dt.datetime.now(_dt.timezone.utc)
     _llm_invocation_id = str(uuid.uuid4())
 
     # v0.9 Phase 3: per-compute provider lookup. Slice (b) routes
@@ -575,7 +575,7 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
                     await db.close()
 
         # D-20: Audit trace on success
-        _llm_completed = _dt.datetime.utcnow()
+        _llm_completed = _dt.datetime.now(_dt.timezone.utc)
         _llm_duration = (_llm_completed - _llm_started).total_seconds() * 1000
         audit_level = comp.get("audit_level", "actions")
         trace_data = {"compute_type": "agent", "calls": [{"response": thinking[:200] if thinking else ""}]}
@@ -588,8 +588,8 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
         )
         await write_audit_trace(
             ctx, comp, invocation_id=_llm_invocation_id, trigger="event",
-            started_at=_llm_started.isoformat() + "Z",
-            completed_at=_llm_completed.isoformat() + "Z",
+            started_at=_llm_started.isoformat().replace("+00:00", "Z"),
+            completed_at=_llm_completed.isoformat().replace("+00:00", "Z"),
             latency_ms=_llm_duration, outcome="success",
             trace_data=trace_data,
             audit_metadata=audit_metadata,
@@ -597,15 +597,15 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
         )
     except AIProviderError as e:
         print(f"[Termin] [ERROR] Compute '{comp_name}': {e}")
-        _llm_err_completed = _dt.datetime.utcnow()
+        _llm_err_completed = _dt.datetime.now(_dt.timezone.utc)
         _llm_err_duration = (_llm_err_completed - _llm_started).total_seconds() * 1000
         audit_metadata = _build_llm_audit_metadata(
             ctx, comp_snake, system_msg, user_msg, None, error_str=str(e),
         )
         await write_audit_trace(
             ctx, comp, invocation_id=_llm_invocation_id, trigger="event",
-            started_at=_llm_started.isoformat() + "Z",
-            completed_at=_llm_err_completed.isoformat() + "Z",
+            started_at=_llm_started.isoformat().replace("+00:00", "Z"),
+            completed_at=_llm_err_completed.isoformat().replace("+00:00", "Z"),
             latency_ms=_llm_err_duration, outcome="error",
             error_message=str(e),
             trace_data={"compute_type": "agent", "error": str(e)},
@@ -620,7 +620,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
     """Execute a Level 3 Agent Compute — autonomous with tool calls."""
     comp_name = comp["name"]["display"]
     comp_snake = comp["name"]["snake"]
-    _agent_started = _dt.datetime.utcnow()
+    _agent_started = _dt.datetime.now(_dt.timezone.utc)
     _agent_invocation_id = str(uuid.uuid4())
 
     # v0.9 Phase 3: per-compute provider lookup (slice b interim
@@ -847,7 +847,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
         if thinking:
             print(f"[Termin] Compute '{comp_name}' completed: {thinking[:100]}")
 
-        _agent_completed = _dt.datetime.utcnow()
+        _agent_completed = _dt.datetime.now(_dt.timezone.utc)
         _agent_duration = (_agent_completed - _agent_started).total_seconds() * 1000
         audit_level = comp.get("audit_level", "actions")
 
@@ -860,7 +860,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
             await _write_refusal_sidecar(
                 ctx, comp, _agent_invocation_id,
                 refusal_state["reason"],
-                _agent_completed.isoformat() + "Z",
+                _agent_completed.isoformat().replace("+00:00", "Z"),
             )
             agent_audit_metadata = _build_agent_audit_metadata(
                 ctx, comp_snake, system_msg, user_msg, tool_calls_log=[],
@@ -869,8 +869,8 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
             await write_audit_trace(
                 ctx, comp, invocation_id=_agent_invocation_id,
                 trigger="event",
-                started_at=_agent_started.isoformat() + "Z",
-                completed_at=_agent_completed.isoformat() + "Z",
+                started_at=_agent_started.isoformat().replace("+00:00", "Z"),
+                completed_at=_agent_completed.isoformat().replace("+00:00", "Z"),
                 latency_ms=_agent_duration, outcome="refused",
                 trace_data={
                     "compute_type": "agent",
@@ -905,8 +905,8 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
         )
         await write_audit_trace(
             ctx, comp, invocation_id=_agent_invocation_id, trigger="event",
-            started_at=_agent_started.isoformat() + "Z",
-            completed_at=_agent_completed.isoformat() + "Z",
+            started_at=_agent_started.isoformat().replace("+00:00", "Z"),
+            completed_at=_agent_completed.isoformat().replace("+00:00", "Z"),
             latency_ms=_agent_duration, outcome="success",
             trace_data=trace_data,
             audit_metadata=agent_audit_metadata,
@@ -914,15 +914,15 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
         )
     except AIProviderError as e:
         print(f"[Termin] [ERROR] Compute '{comp_name}': {e}")
-        _agent_err_completed = _dt.datetime.utcnow()
+        _agent_err_completed = _dt.datetime.now(_dt.timezone.utc)
         _agent_err_duration = (_agent_err_completed - _agent_started).total_seconds() * 1000
         agent_audit_metadata = _build_agent_audit_metadata(
             ctx, comp_snake, system_msg, user_msg, tool_calls_log=[],
         )
         await write_audit_trace(
             ctx, comp, invocation_id=_agent_invocation_id, trigger="event",
-            started_at=_agent_started.isoformat() + "Z",
-            completed_at=_agent_err_completed.isoformat() + "Z",
+            started_at=_agent_started.isoformat().replace("+00:00", "Z"),
+            completed_at=_agent_err_completed.isoformat().replace("+00:00", "Z"),
             latency_ms=_agent_err_duration, outcome="error",
             error_message=str(e),
             trace_data={"compute_type": "agent", "error": str(e)},
@@ -1160,8 +1160,8 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
                     raise HTTPException(status_code=500, detail=taint_err)
 
         # D-20: Audit timing
-        _audit_started = _dt.datetime.utcnow()
-        _audit_started_str = _audit_started.isoformat() + "Z"
+        _audit_started = _dt.datetime.now(_dt.timezone.utc)
+        _audit_started_str = _audit_started.isoformat().replace("+00:00", "Z")
 
         tx = Transaction()
 
@@ -1236,12 +1236,12 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
             raise
         except Exception as e:
             tx.rollback()
-            _audit_err_completed = _dt.datetime.utcnow()
+            _audit_err_completed = _dt.datetime.now(_dt.timezone.utc)
             _audit_err_duration = (_audit_err_completed - _audit_started).total_seconds() * 1000
             await write_audit_trace(
                 ctx, comp, invocation_id=tx.id, trigger="api",
                 started_at=_audit_started_str,
-                completed_at=_audit_err_completed.isoformat() + "Z",
+                completed_at=_audit_err_completed.isoformat().replace("+00:00", "Z"),
                 latency_ms=_audit_err_duration, outcome="error",
                 error_message=str(e),
                 trace_data={"compute_type": "cel", "expression": cel_body, "error": str(e)},
@@ -1301,7 +1301,7 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
             raise HTTPException(status_code=403, detail=taint_err)
 
         # D-20: Audit trace on success
-        _audit_completed = _dt.datetime.utcnow()
+        _audit_completed = _dt.datetime.now(_dt.timezone.utc)
         _audit_duration = (_audit_completed - _audit_started).total_seconds() * 1000
         audit_level = comp.get("audit_level", "actions")
         trace_data = {"compute_type": "cel", "expression": cel_body, "output": result}
@@ -1310,7 +1310,7 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
         await write_audit_trace(
             ctx, comp, invocation_id=tx.id, trigger="api",
             started_at=_audit_started_str,
-            completed_at=_audit_completed.isoformat() + "Z",
+            completed_at=_audit_completed.isoformat().replace("+00:00", "Z"),
             latency_ms=_audit_duration, outcome="success",
             trace_data=trace_data,
         )
