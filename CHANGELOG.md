@@ -5,6 +5,92 @@ All notable changes to `termin-server` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-05-01
+
+Correctness + hygiene patch on top of v0.9.0. Closes the audit-trail
+gaps surfaced by the Phase 3 conformance pack and one stale-action
+hydrator bug surfaced by JL on the warehouse demo.
+
+### Fixed
+
+- **Manual-trigger CEL audit gap** (compute-contract §5.2). v0.9.0's
+  ``execute_compute`` only routed to LLM and ai-agent handlers; for
+  ``default-CEL`` it printed a warning and silently dropped the call,
+  so ``POST /api/v1/compute/<name>/trigger`` for a CEL compute
+  returned ``status: completed`` but never wrote an audit row. v0.9.1
+  adds ``_execute_cel_compute`` (CEL evaluation + audit write) and
+  routes ``provider in (None, "", "cel", "default-CEL")`` to it
+  explicitly. The synchronous endpoint at
+  ``/api/v1/compute/<name>/`` retains its full pre/postcondition
+  + transaction path; ``_execute_cel_compute`` is the slim
+  audit-only path for the manual-trigger / event-handler routes.
+
+- **Anonymous principal stamping** (compute-contract §7.1). Audit
+  rows stamped ``invoked_by_principal_id`` and
+  ``on_behalf_of_principal_id`` as empty strings for anonymous
+  callers. v0.9.1 wires anonymous-principal synthesis through the
+  core identity layer: ``identity._resolve_principal_and_scopes``
+  now calls ``make_anonymous_principal(cookie_name)`` (in
+  ``termin-core``) when the resolved role is anonymous, producing
+  a Principal with id ``anonymous:<sanitized-marker>``. The
+  ``write_audit_trace`` synthesis remains as defense-in-depth for
+  any code path that constructs a bare ``ANONYMOUS_PRINCIPAL``
+  sentinel directly. Operators filter audit logs with
+  ``invoked_by_principal_id LIKE 'anonymous:%'`` to find
+  anonymous-caller activity.
+
+- **Tailwind row-actions stale after state transition**
+  (`static/termin.js`). v0.9.0's hydrator had a hardcoded
+  ``data.status`` precondition gate from the v0.8 single-state-
+  machine era. v0.9 multi-state-machine renamed the column
+  per machine (``product_lifecycle``, ``approval_status``, etc.),
+  so the legacy check always evaluated false and action buttons
+  stayed stale until page refresh. v0.9.1 ``updateActionButtons``
+  reads each transition span's ``data-machine-name``, looks up
+  the row's matching cell, recomputes against the v0.9 nested
+  ``transitions[source][machine][from|to]`` shape, and posts to
+  the v0.9 4-segment ``/_transition/<source>/<machine>/<id>/<target>``
+  URL. Click "Activate" → state cell flips AND action buttons
+  re-render with "Discontinue" replacing "Activate" without
+  refresh.
+
+- **`surface-as-error` channel failure mode** (channel-contract
+  §5.3, BRD §6.4.5). v0.9.0 accepted the grammar but the
+  dispatcher unconditionally swallowed exceptions (log-and-drop
+  fallback). v0.9.1 reads ``failure_mode`` from each channel
+  spec; on ``surface-as-error`` the dispatcher re-raises a
+  ``ChannelError(...)`` to the caller with the original
+  exception chained via ``__cause__``. Source authors can now
+  fail-loud on channels where silent swallowing isn't
+  acceptable.
+
+### Changed
+
+- Renamed ``queue-and-retry-forever`` → ``queue-and-retry`` in
+  the dispatcher comment block. Grammar accepts the new spelling
+  via the ``termin-compiler`` analyzer; v0.9.x falls back to
+  log-and-drop with a logged-warning posture distinguishing the
+  placeholder from the genuine default. Full retry-worker
+  implementation (exponential backoff + dead-letter table after
+  configurable max-retry-hours, 24h cap) lands v0.10.
+
+- ``identity.py`` module docstring refreshed to reflect the v0.9
+  ``the user`` CEL surface (legacy ``User.PascalCase`` was
+  retired in slice 7.5b — TERMIN-S014).
+
+- ``datetime.utcnow()`` (deprecated in Python 3.12, removed in
+  3.13) → ``datetime.now(timezone.utc)`` across 16 sites in
+  ``compute_runner.py`` (audit timing), ``scheduler.py``,
+  ``transaction.py``, and ``pages.py``. Wire format preserved
+  byte-for-byte via ``.replace("+00:00", "Z")`` so audit columns,
+  CEL ``now`` bindings, and any external consumers see identical
+  strings.
+
+### Suite
+
+24 tests passing on Windows (unchanged; the migrations are
+wire-format-preserving).
+
 ## [0.9.0] — 2026-04-30
 
 The opening release of `termin-server`. Phase 7 of the v0.9 Termin
