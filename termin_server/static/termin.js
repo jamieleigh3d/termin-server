@@ -634,40 +634,70 @@ function updateRow(row, data) {
       cell.textContent = data[field] ?? "";
     }
   }
-  // Re-evaluate transition action buttons based on new status
-  if (data.status != null) {
-    updateActionButtons(row, data.status);
-  }
+  // v0.9.1: re-evaluate transition action buttons after every push.
+  // Pre-v0.9 used a generic ``status`` column and only re-evaluated
+  // when the push carried that field; the v0.9 multi-state-machine
+  // refactor renamed the column per-machine (``product_lifecycle``,
+  // ``approval_status``, etc.), which made the legacy ``status``
+  // check always-false and left action buttons stale until refresh.
+  // We always re-evaluate now because (a) action visibility may
+  // depend on a transition column we don't strictly know about
+  // here, and (b) the cost of reading a few data attributes +
+  // recomputing per-span is trivial compared to the click-to-stale
+  // UX bug it fixes.
+  updateActionButtons(row);
 }
 
-function updateActionButtons(row, newStatus) {
+function updateActionButtons(row) {
   // Find the table's source content name
   const table = row.closest("[data-termin-component='data_table']");
   if (!table) return;
   const source = table.dataset.terminSource;
   if (!source) return;
 
-  // Get transition rules from bootstrap
-  const transitions = state.bootstrap && state.bootstrap.transitions
+  // v0.9 multi-SM bootstrap shape: transitions[source][machine_name][from|to] = scope.
+  // Pre-v0.9 was the flat transitions[source][from|to] = scope shape; this
+  // hydrator was migrated alongside the runtime change as part of v0.9.1.
+  const transitionsByMachine = state.bootstrap && state.bootstrap.transitions
     ? state.bootstrap.transitions[source] || {}
     : {};
   const userScopes = state.identity ? new Set(state.identity.scopes) : new Set();
   const recordId = row.dataset.terminRowId;
 
-  // Update each transition button wrapper
+  // Update each transition button wrapper. Each span declares its
+  // own machine name (data-machine-name), so we read the current
+  // state from THAT machine's column on the row (which updateRow
+  // just refreshed for any push that carried it).
   row.querySelectorAll("[data-termin-transition]").forEach(span => {
     const targetState = span.dataset.targetState;
+    const machineName = span.dataset.machineName || "";
     const behavior = span.dataset.behavior || "disable";
-    const transKey = `${newStatus}|${targetState}`;
-    const requiredScope = transitions[transKey];
+
+    // Read the current state from the corresponding column cell.
+    // The state column for a state machine is the machine name
+    // itself in v0.9 (one column per machine).
+    const stateCell = machineName
+      ? row.querySelector(`td[data-termin-field="${machineName}"]`)
+      : null;
+    const currentState = stateCell
+      ? (stateCell.textContent || "").trim()
+      : "";
+
+    const machineTransitions = machineName
+      ? (transitionsByMachine[machineName] || {})
+      : {};
+    const transKey = `${currentState}|${targetState}`;
+    const requiredScope = machineTransitions[transKey];
     const isValid = requiredScope !== undefined;
     const hasScope = isValid && (requiredScope === "" || userScopes.has(requiredScope));
     const safeTarget = targetState.replace(/ /g, "_");
+    const safeMachine = machineName.replace(/ /g, "_");
 
     if (isValid && hasScope) {
-      // Show enabled button
+      // Show enabled button. Form posts to the v0.9 4-segment
+      // transition path: /_transition/<source>/<machine>/<id>/<target>.
       span.innerHTML =
-        `<form method="post" action="/_transition/${source}/${recordId}/${safeTarget}" style="display:inline">` +
+        `<form method="post" action="/_transition/${source}/${safeMachine}/${recordId}/${safeTarget}" style="display:inline">` +
         `<button type="submit" class="text-indigo-600 hover:text-indigo-800 text-xs">${span.dataset.label || targetState}</button></form>`;
     } else if (behavior === "hide") {
       span.innerHTML = "";
