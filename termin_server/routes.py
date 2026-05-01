@@ -201,7 +201,6 @@ def _make_list_route(app, ctx, path, cr, sc, row_filter=None):
             request,
             path_params={"content": _cr},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await list_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -269,7 +268,6 @@ def _make_create_route(app, ctx, path, cr, sc, sm_info, owner_field=None):
             request,
             path_params={"content": _cr},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await create_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -314,7 +312,6 @@ def _make_get_route(app, ctx, path, cr, sc, lc, row_filter=None):
             request,
             path_params={"content": _cr, "key": key_val},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await get_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -358,7 +355,6 @@ def _make_update_route(app, ctx, path, cr, sc, lc, row_filter=None):
             request,
             path_params={"content": _cr, "key": key_val},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await update_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -399,7 +395,6 @@ def _make_delete_route(app, ctx, path, cr, sc, lc, row_filter=None):
             request,
             path_params={"content": _cr, "key": key_val},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await delete_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -446,7 +441,6 @@ def _make_transition_route(app, ctx, path, cr, sc, lc, ts, mn=None):
                 "target": _ts,
             },
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await transition_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -537,7 +531,6 @@ def register_channel_routes(app, ctx: RuntimeContext):
             request,
             path_params={"channel_name": channel_name, "action_name": action_name},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await invoke_channel_action_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -550,7 +543,6 @@ def register_channel_routes(app, ctx: RuntimeContext):
             request,
             path_params={"channel_name": channel_name},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await channel_send_handler(termin_req, ctx)
         return to_fastapi_response(response)
@@ -577,7 +569,6 @@ def register_channel_routes(app, ctx: RuntimeContext):
                     request,
                     path_params={"channel_snake": ch_snake_local},
                     auth=auth,
-                    legacy_user_dict=user,
                 )
                 response = await webhook_receive_handler(
                     termin_req, ctx, channel_spec=ch_spec,

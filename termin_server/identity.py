@@ -77,24 +77,12 @@ def _hydrate_principal_preferences(
     return replace(principal, preferences=merged)
 
 
-def _build_user_object(principal: Principal, role_name: str, scopes: list) -> dict:
-    """Build the standard User object available in CEL expressions.
-
-    The User object is the identity contract between auth providers
-    and the runtime. Any auth provider must produce a Principal that
-    flows through this builder. CEL expressions use PascalCase:
-    User.Name, User.Username, User.Role.
-    """
-    authenticated = not principal.is_anonymous
-    display_name = principal.display_name or ("Anonymous" if not authenticated else "User")
-    return {
-        "Username": display_name.lower().replace(" ", "_") if authenticated else "anonymous",
-        "Name": display_name if authenticated else "Anonymous",
-        "FirstName": display_name.split()[0] if authenticated and display_name else "Anonymous",
-        "Role": role_name,
-        "Scopes": list(scopes),
-        "Authenticated": authenticated,
-    }
+# Slice 7.5b (2026-04-30): the legacy ``_build_user_object`` and the
+# ``User`` PascalCase CEL shape it produced are gone. Source CEL now
+# uses ``the user.X`` (or, post-rewrite, plain ``user.X``); the
+# compiler emits a TERMIN-S014 error on any ``User.X`` reference.
+# The runtime still ships ``the_user`` via ``_build_the_user_object``;
+# every CEL evaluator site binds that key directly.
 
 
 def _resolve_role_key(roles_to_scopes: dict, candidate: str | None) -> str:
@@ -124,12 +112,13 @@ def _resolve_role_key(roles_to_scopes: dict, candidate: str | None) -> str:
 def _build_the_user_object(
     principal: Principal,
     scopes: list,
+    roles: list | tuple = (),
 ) -> dict:
     """v0.9 Phase 6a.4: Build the BRD #3 §4.2-shaped `the user` object.
 
-    Distinct from the legacy `User` object (PascalCase fields) — this
-    is the structure CEL expressions referencing `the user.X` will see.
-    Fields per BRD §4.2:
+    The structure CEL expressions referencing ``the user.X`` see (and,
+    after slice 7.5b's optional-``the`` rewrite, bare ``user.X`` as
+    well). Fields:
 
       id            : principal id (text storage; principal-typed at the
                       business layer)
@@ -137,8 +126,13 @@ def _build_the_user_object(
       is_anonymous  : True iff Anonymous principal
       is_system     : True iff synthetic system principal
       scopes        : list of scope strings the principal holds in this
-                      request (mirrors `User.Scopes` for now)
-      preferences   : per-principal key-value store (e.g., `theme`)
+                      request (one per scope name; flat list)
+      roles         : list of role names assigned to this principal in
+                      this app. v0.9 cookie-based runtime produces a
+                      1-element list; future identity providers can
+                      populate multiple roles. Slice 7.5b extension to
+                      BRD #3 §4.2.
+      preferences   : per-principal key-value store (e.g., ``theme``)
     """
     return {
         "id": principal.id,
@@ -146,6 +140,7 @@ def _build_the_user_object(
         "is_anonymous": principal.is_anonymous,
         "is_system": principal.is_system,
         "scopes": list(scopes),
+        "roles": list(roles),
         "preferences": dict(principal.preferences),
     }
 
@@ -169,13 +164,16 @@ def _build_user_dict(
         "FirstName": display_name if authenticated else "Anonymous",
         "DisplayName": display_name if authenticated else "Anonymous",
     }
-    user_obj = _build_user_object(principal, role_name, scopes)
-    the_user = _build_the_user_object(principal, scopes)
+    # v0.9 cookie-based runtime resolves a single role; expose it as
+    # a 1-element list so source CEL ``the user.roles`` works
+    # uniformly. Future identity providers populate the full set.
+    roles = [role_name] if role_name else []
+    the_user = _build_the_user_object(principal, scopes, roles=roles)
     return {
         "role": role_name,
         "scopes": scopes,
+        "roles": roles,
         "profile": profile,
-        "User": user_obj,
         "Principal": principal,
         "the_user": the_user,
     }

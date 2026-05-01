@@ -32,6 +32,20 @@ from .confidentiality import (
 from .errors import TerminError
 from .transaction import Transaction, ContentSnapshot
 from .boundaries import check_boundary_access
+from .fastapi_adapter import make_auth_context
+from termin_core.routing import build_the_user_for_cel
+
+
+def _the_user_for(user: dict) -> dict:
+    """Slice 7.5b helper: build the ``the_user`` CEL binding from a
+    user-shaped dict (legacy runtime shape).
+
+    Bridges the runtime's existing ``user: dict`` plumbing into the
+    BRD #3 §4.2-shaped binding source CEL expects. Slice 7.5 may
+    eliminate this when every compute call site receives an
+    AuthContext directly.
+    """
+    return build_the_user_for_cel(make_auth_context(user))
 
 
 # ── Prompt building (testable, pure functions) ──
@@ -1016,7 +1030,10 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
                 "Trigger": "api",
                 "StartedAt": tx.started_at,
             },
-            "User": user.get("User", {}),
+            # Slice 7.5b: bind ``the_user`` instead of the legacy ``User``
+            # PascalCase shape. Source CEL spells references as
+            # ``the user.X`` or ``user.X``; both resolve to ``the_user``.
+            "the_user": _the_user_for(user),
         }
 
         # Evaluate preconditions
@@ -1189,7 +1206,6 @@ def register_compute_endpoint(app, ctx: RuntimeContext):
             request,
             path_params={"compute_name": compute_name},
             auth=auth,
-            legacy_user_dict=user,
         )
         response = await trigger_compute_handler(termin_req, ctx)
         return to_fastapi_response(response)

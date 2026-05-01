@@ -95,10 +95,20 @@ def make_auth_context(user: dict) -> AuthContext:
     """
     if not isinstance(user, dict):
         return AuthContext(principal=ANONYMOUS_PRINCIPAL)
+    role_name = str(user.get("role", "") or "")
+    # Slice 7.5b: populate AuthContext.roles. v0.9 single-role runtime
+    # produces a 1-element tuple (or 0-element if no role resolved).
+    # AuthContext.__post_init__ keeps role_name and roles in sync.
+    raw_roles = user.get("roles")
+    if raw_roles is None:
+        roles = (role_name,) if role_name else ()
+    else:
+        roles = tuple(raw_roles or ())
     return AuthContext(
         principal=_principal_from_user_dict(user),
         scopes=tuple(user.get("scopes", []) or []),
-        role_name=str(user.get("role", "") or ""),
+        roles=roles,
+        role_name=role_name,
     )
 
 
@@ -107,7 +117,6 @@ async def to_termin_request(
     *,
     path_params: dict | None = None,
     auth: AuthContext | None = None,
-    legacy_user_dict: dict | None = None,
 ) -> TerminRequest:
     """Wrap a FastAPI :class:`Request` as a :class:`TerminRequest`.
 
@@ -158,7 +167,6 @@ async def to_termin_request(
         auth=auth,
         scheme=fastapi_req.url.scheme,
         client=client,
-        legacy_user_dict=legacy_user_dict,
     )
 
 

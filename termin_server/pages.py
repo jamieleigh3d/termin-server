@@ -174,9 +174,15 @@ def _register_page_get(app, ctx, page, slug, page_reqs, page_templates,
                         for (f, t), s in trans.items()
                     ])
 
+            # Slice 7.5b: drop the legacy ``User`` PascalCase binding;
+            # source CEL spells the caller as ``the user.X`` /
+            # ``user.X``, which both resolve to ``the_user`` after
+            # the rewrite. Build via ``build_the_user_for_cel``.
             import datetime
+            from termin_core.routing import build_the_user_for_cel
+            from termin_server.fastapi_adapter import make_auth_context
             cel_ctx = {
-                "User": user.get("User", {}),
+                "the_user": build_the_user_for_cel(make_auth_context(user)),
                 "now": datetime.datetime.utcnow().isoformat() + "Z",
                 "today": datetime.date.today().isoformat(),
             }
@@ -305,7 +311,10 @@ def _register_form_post(app, ctx, page, slug, reqs):
                     })
         else:
             user = ctx.get_current_user(request)
-            evaluate_field_defaults(data, schema, ctx.expr_eval, user)
+            from termin_server.fastapi_adapter import make_auth_context
+            evaluate_field_defaults(
+                data, schema, ctx.expr_eval, auth=make_auth_context(user),
+            )
 
             # v0.9 multi-SM: state-machine column initial values are
             # the route's responsibility (provider stays SM-agnostic).
