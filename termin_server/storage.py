@@ -138,6 +138,11 @@ _SQL_TYPES = {
     # v0.9.2 L1: structured = opaque JSON-shaped value. Stored as TEXT
     # column holding the JSON encoding (same shape as list-typed fields).
     "structured": "TEXT",
+    # v0.9.2 L2: conversation = ordered list of canonical entries.
+    # Stored as TEXT column holding the JSON encoding of the list.
+    # Per-entry shape, append semantics, and read materialization land
+    # in subsequent slices (L3, L5, L7).
+    "conversation": "TEXT",
 }
 
 
