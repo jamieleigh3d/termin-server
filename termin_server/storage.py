@@ -135,6 +135,9 @@ _SQL_TYPES = {
     "reference": "INTEGER",
     "enum": "TEXT",
     "list": "TEXT",
+    # v0.9.2 L1: structured = opaque JSON-shaped value. Stored as TEXT
+    # column holding the JSON encoding (same shape as list-typed fields).
+    "structured": "TEXT",
 }
 
 
