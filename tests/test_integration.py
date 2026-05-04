@@ -44,7 +44,7 @@ Content called "chat_threads":
   Each chat_thread has a conversation which is conversation
   Anyone with "chat.use" can view chat_threads
   Anyone with "chat.use" can create chat_threads
-  Anyone with "chat.use" can append to chat_threads' conversation
+  Anyone with "chat.use" can append to chat_threads.conversation
 
 As anonymous, I want to chat so that I can verify append:
   Show a page called "Chat"
