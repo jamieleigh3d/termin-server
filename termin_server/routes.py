@@ -149,6 +149,11 @@ def register_crud_routes(app, ctx: RuntimeContext):
         elif kind == "TRANSITION":
             _make_transition_route(app, ctx, path, content_ref, scope,
                                    lookup_col, target_state, machine_name)
+        elif kind == "APPEND":
+            # v0.9.2 L3: field-targeted append on conversation fields.
+            field_name = route.get("field_name")
+            _make_append_route(app, ctx, path, content_ref, scope,
+                               field_name, row_filter)
 
 
 def _make_list_route(app, ctx, path, cr, sc, row_filter=None):
@@ -444,6 +449,132 @@ def _make_transition_route(app, ctx, path, cr, sc, lc, ts, mn=None):
         )
         response = await transition_content_handler(termin_req, ctx)
         return to_fastapi_response(response)
+
+
+# v0.9.2 L3: UUID v7 generator. UUIDv7 is time-ordered (millisecond
+# Unix timestamp prefix) so entry ids sort by creation order — useful
+# for audit citations and chronological reads. We roll our own rather
+# than add a dep; the format follows RFC 9562 §5.7.
+def _uuid7_str() -> str:
+    import os
+    import time
+    import uuid
+    ts_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand_a = int.from_bytes(os.urandom(2), "big") & 0x0FFF  # 12 random bits
+    rand_b = int.from_bytes(os.urandom(8), "big") & ((1 << 62) - 1)
+    high = (ts_ms << 16) | (0x7 << 12) | rand_a   # version=7 in high nibble of time-mid
+    low = (0b10 << 62) | rand_b                    # variant=10 in top two bits
+    return str(uuid.UUID(int=(high << 64) | low))
+
+
+# v0.9.2 L3: canonical conversation entry kinds (per tech-design §7.2).
+# Validated at append time so storage never holds entries the runtime
+# doesn't recognize.
+_CANONICAL_KINDS = frozenset({
+    "user", "assistant", "tool_call", "tool_result", "system_event",
+})
+
+
+def _make_append_route(app, ctx, path, cr, sc, field_name, row_filter=None):
+    """v0.9.2 L3: register a POST /<resource>/{id}/<field>:append handler.
+
+    The handler:
+      1. Loads the parent record by id (404 if not found).
+      2. (If row_filter) checks ownership against the invoking principal.
+      3. Validates the request body — `kind` must be canonical, `body`
+         required.
+      4. Generates a UUIDv7 entry id + ISO timestamp + appended_by_principal_id.
+      5. Reads the existing JSON column value (or [] if null).
+      6. Appends the new entry.
+      7. Writes the column back via update_record.
+      8. Returns 201 with the entry.
+
+    Event firing on append (`<content>.<field>.appended`) is L5's job.
+    WebSocket frame parity is L4's job. This handler ships only the
+    REST surface and the storage round-trip.
+    """
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+
+    deps = [Depends(ctx.require_scope(sc))] if sc else []
+
+    @app.post(path, status_code=201, dependencies=deps)
+    async def append_route(request: Request, _cr=cr, _fn=field_name, _rf=row_filter):
+        # Path-param extraction: the {id} is the only path param on
+        # the canonical APPEND path. If a future variant adds more,
+        # take the first.
+        key_val = list(request.path_params.values())[0] if request.path_params else None
+        if not key_val:
+            raise HTTPException(status_code=400, detail="Missing record id")
+
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        kind = payload.get("kind", "")
+        if kind not in _CANONICAL_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid kind '{kind}'. Must be one of: {sorted(_CANONICAL_KINDS)}",
+            )
+        body_text = payload.get("body")
+        if body_text is None or body_text == "":
+            raise HTTPException(status_code=400, detail="body is required")
+
+        db = await get_db(ctx.db_path)
+        db.row_factory = sqlite3.Row
+        record = await get_record(db, _cr, key_val)
+
+        # Row filter: their_own ownership check on the parent record.
+        # Mirrors what the runtime does for view/update/delete on
+        # owned content (BRD #3 §3.7).
+        if _rf and _rf.get("kind") == "ownership":
+            user = ctx.get_current_user(request)
+            user_id = user.get("id") if user else None
+            owner_field = _rf.get("field")
+            if owner_field and record.get(owner_field) != user_id:
+                raise HTTPException(status_code=404, detail="Not found")
+
+        # Read existing entries (TEXT column holding a JSON array).
+        raw = record.get(_fn)
+        if raw in (None, ""):
+            entries = []
+        else:
+            try:
+                entries = json.loads(raw)
+                if not isinstance(entries, list):
+                    entries = []
+            except (TypeError, ValueError):
+                entries = []
+
+        # Build the new entry with canonical metadata. Optional
+        # caller-supplied fields pass through unchanged; runtime
+        # owns id, created_at, appended_by_principal_id.
+        user = ctx.get_current_user(request) or {}
+        entry = {
+            "id": _uuid7_str(),
+            "kind": kind,
+            "body": body_text,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "appended_by_principal_id": user.get("id", ""),
+        }
+        for k in ("source", "tool_call_id", "parent_id", "tool_name",
+                  "tool_args", "attachments"):
+            if k in payload:
+                entry[k] = payload[k]
+
+        entries.append(entry)
+        await update_record(
+            db, _cr, key_val,
+            {_fn: json.dumps(entries)},
+            terminator=ctx.terminator,
+            event_bus=None,   # L5 will publish the appended event
+        )
+
+        return entry
 
 
 def register_reflection_routes(app, ctx: RuntimeContext):

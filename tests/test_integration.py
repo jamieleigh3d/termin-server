@@ -16,6 +16,131 @@ from __future__ import annotations
 import pytest
 
 
+# ── v0.9.2 L3: APPEND verb on conversation fields ──
+
+
+class TestAppendVerb:
+    """v0.9.2 L3: POST /<resource>/{id}/<field>:append registers from
+    `Anyone with X can append to <plural>' <field>` access rules. The
+    handler generates a UUIDv7 entry id, stamps created_at +
+    appended_by_principal_id, and writes the entry into the JSON
+    column on the parent record. Read-back via GET returns the entry
+    list; the canonical entry shape lives in the runtime, not in the
+    user's source.
+
+    L5 (event firing on append) and L4 (WebSocket frame) are separate
+    slices; this class verifies the REST surface works end-to-end."""
+
+    _APPEND_SOURCE = '''Application: Append Test
+  Description: v0.9.2 L3 fixture
+Id: 7e1b3a2c-4f9d-4e1a-b3c5-1d2e8f4a9c01
+
+Identity:
+  Scopes are "chat.use"
+  An "anonymous" has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads' conversation
+
+As anonymous, I want to chat so that I can verify append:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def append_client(self, tmp_path):
+        """Compile the inline append source on the fly and boot a
+        TestClient against it. Reuses the existing import-installed
+        compiler — both packages live in the same dev venv per the
+        workspace's conventions."""
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._APPEND_SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "append.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as client:
+            yield client
+
+    def test_append_route_registered(self, append_client):
+        """The compile pipeline emits a POST .../conversation:append
+        route from the access rule. Smoke check that the path lives
+        in the app's routing table."""
+        paths = {r.path for r in append_client.app.routes}
+        assert any(":append" in p for p in paths), (
+            f"expected an :append route; got {sorted(paths)}"
+        )
+
+    def test_append_round_trip(self, append_client):
+        """Create a thread, append a user entry, read it back via
+        GET. The entry list grows by one and carries the canonical
+        runtime-set fields (id, created_at)."""
+        # Create a parent record first.
+        create = append_client.post(
+            "/api/v1/chat_threads", json={"title": "round trip"})
+        assert create.status_code in (200, 201), create.text
+        thread = create.json()
+        thread_id = thread.get("id")
+        assert thread_id, f"create returned no id: {thread}"
+
+        # Append a user entry.
+        append = append_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user", "body": "hello"})
+        assert append.status_code == 201, append.text
+        entry = append.json()
+        assert entry.get("kind") == "user"
+        assert entry.get("body") == "hello"
+        assert entry.get("id"), "entry must carry a runtime-generated id"
+        assert entry.get("created_at"), "entry must carry created_at"
+
+        # Read back: the JSON column now holds the entry list.
+        import json as _json
+        get = append_client.get(f"/api/v1/chat_threads/{thread_id}")
+        assert get.status_code == 200, get.text
+        record = get.json()
+        raw = record.get("conversation")
+        entries = _json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(entries, list)
+        assert len(entries) == 1
+        assert entries[0]["body"] == "hello"
+
+    def test_append_rejects_invalid_kind(self, append_client):
+        """Non-canonical kinds get a 400, not silently stored. Keeps
+        downstream conversation handling honest."""
+        create = append_client.post(
+            "/api/v1/chat_threads", json={"title": "invalid kind test"})
+        thread_id = create.json()["id"]
+        bad = append_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "refusal", "body": "nope"})  # refusal isn't canonical
+        assert bad.status_code == 400, bad.text
+
+    def test_append_requires_body(self, append_client):
+        """Missing body field → 400. The runtime won't append a blank entry."""
+        create = append_client.post(
+            "/api/v1/chat_threads", json={"title": "missing body test"})
+        thread_id = create.json()["id"]
+        bad = append_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user"})
+        assert bad.status_code == 400, bad.text
+
+
 # ── Reflection / introspection ──
 
 
