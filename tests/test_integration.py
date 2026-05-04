@@ -626,6 +626,135 @@ As anonymous, I want to chat so that I can verify auth gate:
         assert rest_entry["source"] == "rest-test"
 
 
+# ── v0.9.2 L7.4: refusal as conversation entry ──
+
+
+class TestRefusalAppendedToConversation:
+    """v0.9.2 L7.4: when an ai-agent compute calls system_refuse AND
+    the compute has a `Conversation is X.Y` source declared, the
+    runtime appends a `kind: "assistant", type: "refusal"` entry to
+    the conversation field. This is the chat surface for refusals;
+    the WARN-level audit log entry remains the audit-trail surface
+    (per L7.5's sidecar retirement).
+
+    Tests drive `_execute_agent_compute` directly with a stub
+    provider so we don't need a real Anthropic API key. The compute's
+    conversation_source IR field is set manually on the comp dict
+    (the L6 compiler-side wiring lowers `Conversation is X.Y` to
+    that field; this fixture skips the compile step for the unit-
+    test-style assertion)."""
+
+    def test_refusal_appends_to_conversation(self, tmp_path):
+        import asyncio
+        import json as _json
+        from termin_server import create_termin_app
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+
+        # Compile a minimal ai-agent app with `Conversation is`.
+        # Note: the agent's actual provider is replaced with a stub
+        # below — this source just gets us the IR shape with
+        # conversation_source populated.
+        source = '''Application: Refusal Conv Test
+  Description: v0.9.2 L7.4 fixture
+Id: 5d7c1b2e-8f4a-4b1c-9d8e-2f5a3b7c8d93
+
+Identity:
+  Scopes are "chat.use"
+  An "anonymous" has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads.conversation
+
+Compute called "reply":
+  Provider is "ai-agent"
+  Trigger on event "chat_threads.conversation.appended" where `appended_entry.kind == "user"`
+  Conversation is chat_threads.conversation
+  Anyone with "chat.use" can execute this
+  Audit level: actions
+  Anyone with "chat.use" can audit
+  Directive is ```
+    You refuse everything via system.refuse.
+  ```
+
+As anonymous, I want to chat so that I can see refusals:
+  Show a page called "Chat"
+'''
+        program, perr = parse_peg(source)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "refusal_conv.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+
+        # Swap the agent provider for a stub that always refuses.
+        class _StubLegacy:
+            async def agent_loop(self, system, user, tools, execute_tool):
+                await execute_tool("system_refuse", {"reason": "unsupported request"})
+                return {"thinking": "refused", "response": ""}
+
+        class _StubProvider:
+            is_configured = True
+            service = "stub"
+            model = "stub-1"
+            legacy = _StubLegacy()
+            _config_hash = "sha256:stub"
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None
+            )
+            assert ctx is not None
+            ctx.compute_providers = {"reply": _StubProvider()}
+
+            # Create the parent record + append a user message —
+            # which fires the trigger and runs the agent.
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "refusal test"})
+            assert create.status_code in (200, 201), create.text
+            thread_id = create.json()["id"]
+
+            ap = client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "do something"})
+            assert ap.status_code == 201, ap.text
+
+            # The agent runs in a background thread per the dispatch
+            # path. Give it a moment to complete.
+            import time
+            time.sleep(0.5)
+
+            # Read the conversation back. The user entry should be
+            # there + the refusal entry from the agent.
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            assert get.status_code == 200
+            raw = get.json().get("conversation")
+            entries = _json.loads(raw) if isinstance(raw, str) else raw
+            assert isinstance(entries, list), entries
+            assert len(entries) == 2, (
+                f"expected user + refusal entries, got {entries!r}"
+            )
+            assert entries[0]["kind"] == "user"
+            assert entries[0]["body"] == "do something"
+            assert entries[1]["kind"] == "assistant"
+            assert entries[1].get("type") == "refusal"
+            assert entries[1]["body"] == "unsupported request"
+            # parent_id traces back to the user message that triggered
+            # the agent's turn.
+            assert entries[1].get("parent_id") == entries[0]["id"]
+
+
 # ── Reflection / introspection ──
 
 

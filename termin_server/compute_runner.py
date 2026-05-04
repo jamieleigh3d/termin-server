@@ -286,7 +286,7 @@ def _build_agent_audit_metadata(
 
 async def execute_compute(ctx: RuntimeContext, comp: dict, record: dict,
                           content_name: str, main_loop=None,
-                          invoked_by=None):
+                          invoked_by=None, triggering_entry: dict = None):
     """Execute a Compute triggered by an event or manual /trigger call.
 
     ``invoked_by`` is the upstream Principal who caused this run. For
@@ -296,6 +296,12 @@ async def execute_compute(ctx: RuntimeContext, comp: dict, record: dict,
     event chain doesn't carry one — system-triggered, scheduler).
     Threaded through to ``write_audit_trace`` so the audit row
     stamps the right principal columns per BRD §6.3.4.
+
+    ``triggering_entry`` (v0.9.2 L7.4) is the appended_entry payload
+    when the compute was triggered by a `<X>.<Y>.appended` event.
+    Used for setting `parent_id` on auto-write-back conversation
+    entries (refusals in this slice; assistant text + tool_call/result
+    in L7.3). None on manual /trigger and scheduler paths.
     """
     comp_name = comp["name"]["display"]
     provider = comp.get("provider", "cel")
@@ -309,6 +315,7 @@ async def execute_compute(ctx: RuntimeContext, comp: dict, record: dict,
         await _execute_agent_compute(
             ctx, comp, record, content_name, main_loop,
             invoked_by=invoked_by,
+            triggering_entry=triggering_entry,
         )
     elif provider in (None, "", "cel", "default-CEL"):
         # v0.9.1: default-CEL via /trigger now writes an audit row.
@@ -584,8 +591,16 @@ async def _execute_llm_compute(ctx: RuntimeContext, comp: dict, record: dict,
 
 async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                                   content_name: str, main_loop=None,
-                                  invoked_by=None):
-    """Execute a Level 3 Agent Compute — autonomous with tool calls."""
+                                  invoked_by=None, triggering_entry: dict = None):
+    """Execute a Level 3 Agent Compute — autonomous with tool calls.
+
+    ``triggering_entry`` (v0.9.2 L7.4) is the entry payload from the
+    upstream `<X>.<Y>.appended` event, when the compute was triggered
+    by one. Used to set `parent_id` on auto-write-back conversation
+    entries so reviewers can trace from a refusal (or, post-L7.3, an
+    assistant response or tool_call/result) back to the user message
+    that started the turn.
+    """
     comp_name = comp["name"]["display"]
     comp_snake = comp["name"]["snake"]
     _agent_started = _dt.datetime.now(_dt.timezone.utc)
@@ -850,6 +865,58 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 audit_metadata=agent_audit_metadata,
                 invoked_by=invoked_by,
             )
+            # v0.9.2 L7.4: append the refusal as a conversation entry
+            # so the chat provider renders it inline at source position.
+            # Per tech-design §7.2 + §11.5, refusal is an assistant-kind
+            # entry with type="refusal" — not a separate kind. The
+            # entry is appended to the compute's conversation_source
+            # (an L6 IR field). Computes without a Conversation source
+            # (legacy ai-agent computes still using the messages-
+            # collection pattern) get the audit row only — they have
+            # no field to append to.
+            conversation_source = comp.get("conversation_source")
+            if conversation_source and len(conversation_source) == 2:
+                from .routes import _do_append, AppendValidationError, AppendNotFoundError
+                conv_content, conv_field = conversation_source
+                # Resolve parent_id from the upstream appended_entry
+                # (set by the .appended event dispatch path). None on
+                # other trigger paths — the entry's parent_id stays
+                # unset, which is harmless.
+                parent_id = None
+                if triggering_entry:
+                    parent_id = triggering_entry.get("id")
+                refusal_payload = {
+                    "kind": "assistant",
+                    "type": "refusal",
+                    "body": refusal_state["reason"],
+                }
+                if parent_id:
+                    refusal_payload["parent_id"] = parent_id
+                # User dict for _do_append. The runtime has the
+                # invoked_by Principal; map to the legacy user-dict
+                # shape _do_append expects until the WS auth refactor
+                # (slice 7.5).
+                user_dict = {}
+                if invoked_by is not None:
+                    user_dict = {"id": getattr(invoked_by, "id", "") or ""}
+                try:
+                    await _do_append(
+                        ctx,
+                        content_ref=conv_content,
+                        key_val=record.get("id") if record else None,
+                        field_name=conv_field,
+                        payload=refusal_payload,
+                        user=user_dict,
+                        row_filter=None,
+                    )
+                except (AppendValidationError, AppendNotFoundError) as e:
+                    # The audit row already captured the refusal — log
+                    # the secondary failure but don't propagate.
+                    print(
+                        f"[Termin] [WARN] Compute '{comp_name}': "
+                        f"refusal recorded in audit but failed to append "
+                        f"to conversation {conv_content}.{conv_field}: {e}"
+                    )
             return
 
         trace_data = {"compute_type": "agent", "calls": [{"response": thinking[:200] if thinking else ""}]}

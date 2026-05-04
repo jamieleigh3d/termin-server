@@ -829,9 +829,22 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                         # upstream session through the event record.
                         _event_invoked_by = make_anonymous_principal()
 
+                    # v0.9.2 L7.4: capture the appended_entry into the
+                    # closure so the agent compute can set parent_id on
+                    # any auto-write-back entries it produces (refusals
+                    # in this slice; assistant text + tool_call/result
+                    # in L7.3). None when the trigger isn't an .appended
+                    # event (manual /trigger, scheduler) — that's fine,
+                    # parent_id stays unset on those entries.
+                    _trigger_entry = (
+                        dict(appended_entry)
+                        if appended_entry is not None else None
+                    )
+
                     def _run_compute(_comp=comp, _record=dict(record),
                                      _content=content_name, _loop=_main_loop,
-                                     _invoked_by=_event_invoked_by):
+                                     _invoked_by=_event_invoked_by,
+                                     _trig=_trigger_entry):
                         import asyncio as _aio
                         bg_loop = _aio.new_event_loop()
                         try:
@@ -839,6 +852,7 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                                 execute_compute(
                                     ctx, _comp, _record, _content, _loop,
                                     invoked_by=_invoked_by,
+                                    triggering_entry=_trig,
                                 ))
                         except Exception as e:
                             print(f"[Termin] [ERROR] Compute '{_comp['name']['display']}' failed: {e}")
@@ -847,8 +861,8 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     threading.Thread(target=_run_compute, daemon=True).start()
 
     ctx.run_event_handlers = run_event_handlers
-    ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None, invoked_by=None: \
-        execute_compute(ctx, comp, record or {}, content_name, main_loop, invoked_by=invoked_by)
+    ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None, invoked_by=None, triggering_entry=None: \
+        execute_compute(ctx, comp, record or {}, content_name, main_loop, invoked_by=invoked_by, triggering_entry=triggering_entry)
 
     # Content schemas for storage init
     schemas = list(ir.get("content", []))

@@ -600,7 +600,12 @@ async def _do_append(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "appended_by_principal_id": appender_id,
     }
-    for k in ("source", "tool_call_id", "parent_id", "tool_name",
+    # v0.9.2 L7.4 (per JL Wave 3 §7.2 update): `type` is an optional
+    # per-kind sub-discriminator (free-form text). v0.9.2 documents
+    # `assistant.type == "refusal"` for system.refuse-driven entries;
+    # other kinds reserve the field for later. No validation — the
+    # field passes through to storage as whatever the caller supplied.
+    for k in ("type", "source", "tool_call_id", "parent_id", "tool_name",
               "tool_args", "attachments"):
         if k in payload:
             entry[k] = payload[k]
