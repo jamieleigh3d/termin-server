@@ -602,3 +602,177 @@ class TestRefusalRegressionUnderL71:
             assert kinds == ["user", "assistant"], entries
             assert entries[1]["type"] == "refusal"
             assert entries[1]["body"] == "nope"
+
+
+# ── L11: examples/agent_chatbot.termin (the v0.9.2 canonical example)
+#
+# The integration tests below boot the actual `examples/agent_chatbot.termin`
+# program — not a synthesized fixture — and stub the legacy provider so
+# we can exercise the full conversation-mode path without a live API
+# key. This is the "tests pass != it works" rule met halfway: the
+# example compiles and the runtime materializes / writes back per
+# §11.5 against a stub. End-to-end with a real Anthropic key is
+# verified out-of-band.
+
+
+def _compile_agent_chatbot(tmp_path):
+    """Compile the canonical examples/agent_chatbot.termin and boot it
+    against a fresh per-test SQLite DB. Returns the FastAPI app."""
+    from pathlib import Path
+    from termin import peg_parser, analyzer, lower
+    from termin_core.ir.serialize import serialize_ir
+    from termin_server import create_termin_app
+
+    # Resolve the example relative to the termin-compiler repo. We
+    # walk up from this test file: termin-server/tests/<this> ->
+    # termin-server -> ClaudeWorkspace -> termin-compiler/examples.
+    example_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / "termin-compiler" / "examples" / "agent_chatbot.termin"
+    )
+    source = example_path.read_text(encoding="utf-8")
+    program, perr = peg_parser.parse_peg(source)
+    assert perr.ok, perr.format()
+    aerr = analyzer.analyze(program)
+    assert aerr.ok, aerr.format()
+    spec = lower.lower(program)
+    ir_json = serialize_ir(spec)
+    db_path = str(tmp_path / "agent_chatbot.db")
+    return create_termin_app(ir_json, db_path=db_path)
+
+
+class TestAgentChatbotV092EndToEnd:
+    """L11: the v0.9.2 examples/agent_chatbot.termin example compiles
+    and runs the conversation-mode agent loop. This is the example
+    test surface — it needs to keep passing every time someone
+    touches the conversation-mode dispatch."""
+
+    def test_multi_turn_conversation_threads_through_agent(self, tmp_path):
+        """Two user turns → two assistant replies, all parent-linked,
+        all in source order on the conversation field."""
+        from fastapi.testclient import TestClient
+
+        # Stub legacy that echoes the latest user message back. The
+        # `messages` array the runtime hands the legacy is the
+        # materialized §11.4 shape; the stub digs the latest user
+        # text out of it for a deterministic reply.
+        class _EchoLegacy:
+            def __init__(self):
+                self.calls = []
+
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_event=None, max_turns=20,
+            ):
+                self.calls.append({"messages": messages})
+                # Pull the most recent user-role text block.
+                last_user = ""
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        for block in msg.get("content") or []:
+                            if block.get("type") == "text":
+                                last_user = block.get("text", "")
+                                break
+                        if last_user:
+                            break
+                await on_writeback(
+                    kind="assistant",
+                    body=f"echo: {last_user}",
+                )
+                return {"thinking": "", "summary": "ok"}
+
+        app = _compile_agent_chatbot(tmp_path)
+        stub = _EchoLegacy()
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            assert ctx is not None
+            ctx.compute_providers = {"reply": _StubProvider(stub)}
+
+            # Create a thread, drive two user turns through the
+            # append endpoint, verify the agent reply lands on each.
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "demo"})
+            assert create.status_code in (200, 201), create.text
+            thread_id = create.json()["id"]
+
+            ap1 = client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "hi"})
+            assert ap1.status_code == 201
+            time.sleep(0.4)
+
+            ap2 = client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "again"})
+            assert ap2.status_code == 201
+            time.sleep(0.4)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        kinds = [e["kind"] for e in entries]
+        assert kinds == [
+            "user", "assistant", "user", "assistant",
+        ], entries
+        # Each assistant reply parent-links to the user message
+        # *that triggered its turn* — not the most recent overall.
+        assert entries[1]["parent_id"] == entries[0]["id"]
+        assert entries[3]["parent_id"] == entries[2]["id"]
+        assert entries[1]["body"] == "echo: hi"
+        assert entries[3]["body"] == "echo: again"
+        # The second turn's materialized history must include the
+        # first turn (not just the new user message). The agent sees
+        # the full conversation each time per §11.5's no-truncation
+        # stance for v0.9.2.
+        second_turn_msgs = stub.calls[1]["messages"]
+        # After adjacent-role merging: turn 2's history is
+        # [user("hi"), assistant("echo: hi"), user("again")] — three
+        # messages alternating roles.
+        assert len(second_turn_msgs) == 3
+        assert second_turn_msgs[0]["role"] == "user"
+        assert second_turn_msgs[1]["role"] == "assistant"
+        assert second_turn_msgs[2]["role"] == "user"
+        assert second_turn_msgs[2]["content"][0]["text"] == "again"
+
+    def test_refusal_renders_inline_via_v092_path(self, tmp_path):
+        """The refusal-as-assistant-with-type=refusal path (L7.4)
+        works against the canonical example."""
+        from fastapi.testclient import TestClient
+
+        class _RefuseLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_event=None, max_turns=20,
+            ):
+                await execute_tool(
+                    "system_refuse",
+                    {"reason": "fabricating sources is off-policy"},
+                )
+                return {"thinking": "", "summary": ""}
+
+        app = _compile_agent_chatbot(tmp_path)
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_RefuseLegacy())}
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "refuse demo"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user",
+                      "body": "Make up a real-sounding citation."})
+            time.sleep(0.4)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        assert [e["kind"] for e in entries] == ["user", "assistant"]
+        assert entries[1]["type"] == "refusal"
+        assert "fabricating" in entries[1]["body"]
