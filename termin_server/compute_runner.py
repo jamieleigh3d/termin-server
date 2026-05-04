@@ -626,10 +626,35 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
     # Build prompts (Fix 009.1 + 009.2)
     system_msg, user_msg = _build_agent_prompts(comp, record)
 
+    # v0.9.2 L7.1: conversation-mode detection. When the compute
+    # declares `Conversation is X.Y`, the agent runs the §11.5
+    # auto-write-back path: the user-message string is replaced by
+    # a materialized Anthropic-shape messages list, set_output is
+    # stripped from the tool surface (no completion sentinel), and
+    # each tool_call / tool_result / final assistant text the agent
+    # produces is appended back to the conversation field via
+    # _do_append. Refusal (L7.4) still wins over normal write-back.
+    conversation_source = comp.get("conversation_source")
+    is_conv_mode = (
+        conversation_source and len(conversation_source) == 2
+    )
+
     # Build tools
     agent_tools = build_agent_tools(accesses, ctx.content_lookup)
-    set_output = _build_agent_set_output(comp, ctx.content_lookup)
-    all_tools = agent_tools + [set_output]
+    if is_conv_mode:
+        # No set_output on conversation mode — the agent communicates
+        # by ending its turn with text. Per §11.5 + L7 design.
+        all_tools = agent_tools
+        # Per §11.3, append the refusal marker so the model knows
+        # system.refuse is reachable.
+        system_msg = (
+            (system_msg or "")
+            + "\n\nYou may refuse a request you cannot fulfill by "
+              "calling system.refuse(reason)."
+        ).strip()
+    else:
+        set_output = _build_agent_set_output(comp, ctx.content_lookup)
+        all_tools = agent_tools + [set_output]
 
     # v0.9 Phase 3 slice (e): refusal capture state. Mutated by
     # _execute_tool when the agent calls system_refuse; consulted
@@ -819,9 +844,90 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 },
             })
 
+    # v0.9.2 L7.1+L7.3: conversation-mode write-back state. Captured
+    # so we don't fire write-back if the agent later refuses (refusal
+    # path owns the entry per L7.4 — the writes to the conversation
+    # field are exclusive between normal-completion and refusal).
+    _writeback_log: list[dict] = []
+    _conv_user_dict: dict = {}
+    if invoked_by is not None:
+        _conv_user_dict = {"id": getattr(invoked_by, "id", "") or ""}
+
+    async def _on_writeback(*, kind: str, body: str, **fields):
+        """v0.9.2 L7.3: append one auto-write-back entry to the
+        conversation field. Each entry shares parent_id = triggering
+        user entry id so reviewers can reconstruct turn boundaries.
+
+        The runtime owns parent_id (resolved from triggering_entry);
+        the provider supplies kind, body, and the structured fields
+        per kind (tool_call_id, tool_name, tool_args for tool_call;
+        tool_call_id, is_error for tool_result).
+        """
+        from .routes import (
+            _do_append, AppendValidationError, AppendNotFoundError,
+        )
+        conv_content, conv_field = conversation_source
+        payload: dict = {"kind": kind, "body": body}
+        if triggering_entry:
+            tparent = triggering_entry.get("id")
+            if tparent:
+                payload["parent_id"] = tparent
+        # Pass through provider-supplied structured fields. The
+        # _do_append passthrough list (routes.py) already accepts
+        # tool_call_id / tool_name / tool_args / parent_id / etc.
+        for k, v in fields.items():
+            payload[k] = v
+        try:
+            entry = await _do_append(
+                ctx,
+                content_ref=conv_content,
+                key_val=record.get("id") if record else None,
+                field_name=conv_field,
+                payload=payload,
+                user=_conv_user_dict,
+                row_filter=None,
+            )
+            _writeback_log.append(entry)
+        except (AppendValidationError, AppendNotFoundError) as e:
+            print(
+                f"[Termin] [WARN] Compute '{comp_name}': "
+                f"failed to append {kind!r} entry to conversation "
+                f"{conv_content}.{conv_field}: {e}"
+            )
+
     try:
         legacy = provider.legacy
-        if ctx.event_bus is not None and hasattr(
+        if is_conv_mode and hasattr(
+                legacy, "agent_loop_with_conversation"):
+            # v0.9.2 L7.1: load the conversation field, materialize
+            # to Anthropic shape, run the §11.5 conversation loop.
+            from .ai_provider import (
+                materialize_to_anthropic,
+                ConversationMaterializationError,
+            )
+            raw_field = (record or {}).get(conversation_source[1])
+            if raw_field in (None, ""):
+                conv_entries: list = []
+            elif isinstance(raw_field, list):
+                conv_entries = raw_field
+            else:
+                try:
+                    conv_entries = json.loads(raw_field)
+                    if not isinstance(conv_entries, list):
+                        conv_entries = []
+                except (TypeError, ValueError):
+                    conv_entries = []
+            try:
+                messages = materialize_to_anthropic(conv_entries)
+            except ConversationMaterializationError as e:
+                raise AIProviderError(
+                    f"conversation materialization failed: {e}"
+                ) from e
+            result = await legacy.agent_loop_with_conversation(
+                system_msg, messages, all_tools, _execute_tool,
+                on_writeback=_on_writeback,
+            )
+        elif ctx.event_bus is not None and hasattr(
                 legacy, "agent_loop_streaming"):
             result = await legacy.agent_loop_streaming(
                 system_msg, user_msg, all_tools, _execute_tool,

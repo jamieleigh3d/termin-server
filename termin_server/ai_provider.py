@@ -26,6 +26,176 @@ class AIProviderError(Exception):
     pass
 
 
+class ConversationMaterializationError(Exception):
+    """v0.9.2 §11.4: a conversation entry list violated the canonical
+    materialization contract (e.g. a tool_result whose tool_call_id
+    doesn't match any preceding tool_call). Raised by
+    ``materialize_to_anthropic``; the runtime treats it as a
+    server-side error (the source-of-truth field has bad data the
+    runtime can't translate into a valid provider call)."""
+
+
+# ── v0.9.2 L7.2: canonical kind → Anthropic mapping ──
+#
+# Per tech-design §11.4 (verified against Anthropic API docs):
+#   Termin kind     | Anthropic role | content blocks
+#   user            | user           | {type:text} + image/document blocks
+#   assistant       | assistant      | {type:text} (+ image blocks where supported)
+#   tool_call       | assistant      | {type:tool_use, id, name, input}
+#   tool_result     | user           | {type:tool_result, tool_use_id, content, is_error?}
+#   system_event    | user           | {type:text, text:"[<source>] <body>"}
+#
+# The `assistant.type == "refusal"` discriminator is **not** sent to
+# Anthropic — refusal-type assistant entries map identically to
+# response-type ones. The type field is for Termin's audit and chat
+# rendering only. Per tech-design §11.4.
+#
+# Adjacent same-role entries are merged into one message with multiple
+# content blocks (Anthropic requires alternating user/assistant
+# roles).
+#
+# Tool linkage rule: every tool_result must reference a tool_call_id
+# that appears in a prior tool_call entry. Orphan tool_results raise
+# ConversationMaterializationError.
+
+_KINDS_USER_ROLE = frozenset({"user", "tool_result", "system_event"})
+_KINDS_ASSISTANT_ROLE = frozenset({"assistant", "tool_call"})
+
+
+def _entry_role(kind: str) -> str:
+    """Map a Termin entry kind to its Anthropic role."""
+    if kind in _KINDS_ASSISTANT_ROLE:
+        return "assistant"
+    if kind in _KINDS_USER_ROLE:
+        return "user"
+    # Defensive: callers should validate kind upstream (the append
+    # endpoint enforces _CANONICAL_KINDS); fall back to user role.
+    return "user"
+
+
+def _build_content_blocks(entry: dict) -> list[dict]:
+    """Build the Anthropic content-blocks list for a single entry.
+
+    The block shape depends on the entry's kind:
+      - user / assistant / system_event → text block (+ attachments
+        for user)
+      - tool_call → tool_use block
+      - tool_result → tool_result block
+    """
+    kind = entry.get("kind", "")
+    body = entry.get("body", "")
+
+    if kind == "tool_call":
+        return [{
+            "type": "tool_use",
+            "id": entry.get("tool_call_id", ""),
+            "name": entry.get("tool_name", ""),
+            "input": entry.get("tool_args") or {},
+        }]
+
+    if kind == "tool_result":
+        block: dict = {
+            "type": "tool_result",
+            "tool_use_id": entry.get("tool_call_id", ""),
+            "content": body,
+        }
+        if entry.get("is_error"):
+            block["is_error"] = True
+        return [block]
+
+    # text-bearing kinds: user, assistant, system_event
+    if kind == "system_event":
+        # Wrap with source prefix so the in-band context is
+        # distinguishable from real user input. Per §11.4.
+        source = entry.get("source", "system") or "system"
+        text = f"[{source}] {body}"
+    else:
+        text = body
+
+    blocks: list[dict] = [{"type": "text", "text": text}]
+
+    # Attachments ride alongside text in the same content array
+    # (image/document blocks per §11.4 attachments rule). Only
+    # user-kind entries carry attachments in v0.9.2; assistant
+    # attachments are out of scope for v0.9.2 (depends on
+    # Anthropic's per-model assistant-image acceptance).
+    if kind == "user":
+        for att in entry.get("attachments") or ():
+            media_type = (att.get("media_type") or "").lower()
+            source = att.get("source") or {}
+            if media_type.startswith("image/"):
+                blocks.append({
+                    "type": "image",
+                    "source": source,
+                })
+            elif media_type == "application/pdf":
+                blocks.append({
+                    "type": "document",
+                    "source": source,
+                })
+            # Unknown media types are dropped silently — the runtime's
+            # append-time validation should have caught them.
+
+    return blocks
+
+
+def materialize_to_anthropic(entries) -> list[dict]:
+    """Translate a Termin conversation field's entry list into
+    Anthropic's messages array per §11.4.
+
+    Returns: ``list[{role, content: list[block]}]`` ready to pass to
+    ``anthropic.messages.create(messages=...)``.
+
+    Raises ``ConversationMaterializationError`` on:
+      - tool_result with tool_call_id that doesn't match a prior
+        tool_call entry (orphan).
+
+    Adjacent same-role entries merge into one message with the
+    blocks concatenated (Anthropic requires alternating user/
+    assistant roles).
+    """
+    if not entries:
+        return []
+
+    seen_tool_call_ids: set[str] = set()
+    messages: list[dict] = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind", "")
+        if not kind:
+            continue
+
+        # Tool linkage validation — done before we map the entry so
+        # we don't half-build a turn before failing.
+        if kind == "tool_call":
+            tcid = entry.get("tool_call_id", "")
+            if tcid:
+                seen_tool_call_ids.add(tcid)
+        elif kind == "tool_result":
+            tcid = entry.get("tool_call_id", "")
+            if not tcid or tcid not in seen_tool_call_ids:
+                raise ConversationMaterializationError(
+                    f"tool_result entry references unknown "
+                    f"tool_call_id {tcid!r}; no preceding tool_call "
+                    f"with that id."
+                )
+
+        role = _entry_role(kind)
+        blocks = _build_content_blocks(entry)
+        if not blocks:
+            continue
+
+        if messages and messages[-1]["role"] == role:
+            # Adjacent same-role merge.
+            messages[-1]["content"].extend(blocks)
+        else:
+            messages.append({"role": role, "content": list(blocks)})
+
+    return messages
+
+
 class StreamingJsonFieldExtractor:
     """Parses growing JSON text from a tool-use stream and emits per-field
     events: field_delta (string-value chunk) and field_done (complete
@@ -862,6 +1032,173 @@ class AIProvider:
             return await self._openai_complete(system_prompt, user_message, output_tool)
         else:
             raise AIProviderError(f"Unknown service: {self._service}")
+
+    async def agent_loop_with_conversation(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        execute_tool: Any,
+        on_writeback: Any,
+        on_event: Any = None,
+        max_turns: int = 20,
+    ) -> dict:
+        """v0.9.2 §11.5: agent loop driven by a pre-materialized
+        Anthropic-shape ``messages`` array (not a single user_message
+        string). Calls ``on_writeback(kind=..., body=..., **fields)``
+        per source-order action so the runtime can append each
+        tool_call / tool_result / final assistant text back to the
+        conversation field.
+
+        No forced ``set_output``: the agent communicates by ending its
+        turn naturally. The final assistant text is delivered via
+        ``on_writeback(kind="assistant", body=text)``.
+
+        ``on_writeback`` is async; the runtime awaits it for each
+        action so write-back ordering matches source order. The
+        runtime is responsible for setting parent_id on the persisted
+        entries — the provider supplies tool_call_id / tool_name /
+        tool_args (for tool_call) or tool_call_id / is_error (for
+        tool_result) and lets the runtime layer in metadata.
+
+        Returns: ``{"thinking": "...", "summary": "..."}`` for audit /
+        legacy-compat consumers.
+        """
+        if not self._client:
+            raise AIProviderError("AI provider not initialized")
+        if self._service == "anthropic":
+            return await self._anthropic_agent_loop_with_conversation(
+                system_prompt, messages, tools, execute_tool,
+                on_writeback, on_event, max_turns,
+            )
+        # OpenAI conversation-mode is out of v0.9.2 scope; the
+        # analyzer-side check (TERMIN-S061 etc) doesn't gate on
+        # provider service, so adding OpenAI is a future-friendly
+        # extension. For now, refuse loudly.
+        raise AIProviderError(
+            f"agent_loop_with_conversation: {self._service!r} not "
+            f"yet implemented; v0.9.2 ships Anthropic only."
+        )
+
+    async def _anthropic_agent_loop_with_conversation(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        execute_tool,
+        on_writeback,
+        on_event,
+        max_turns: int,
+    ) -> dict:
+        """Anthropic implementation of ``agent_loop_with_conversation``.
+
+        Per turn:
+          1. Call ``messages.create`` with the running messages list.
+          2. For each tool_use block: emit on_writeback("tool_call",
+             body=f"{name}({json.dumps(args)})", tool_call_id, tool_name,
+             tool_args), execute via ``execute_tool``, emit
+             on_writeback("tool_result", body=result_str,
+             tool_call_id, is_error), append the assistant turn and
+             tool_results to the local messages array.
+          3. For each text block on the final response (no tool calls):
+             emit on_writeback("assistant", body=text) and return.
+
+        ``on_event`` is reserved for future per-token streaming on the
+        conversation path; v0.9.2 ships non-streaming.
+        """
+        import anthropic
+        running_messages = list(messages)
+
+        for turn in range(max_turns):
+            try:
+                response = self._client.messages.create(
+                    model=self._model or "claude-sonnet-4-6",
+                    max_tokens=4096,
+                    system=system_prompt,
+                    messages=running_messages,
+                    tools=tools,
+                )
+            except anthropic.APIError as e:
+                raise AIProviderError(
+                    f"Anthropic API error on turn {turn}: {e}"
+                )
+
+            text_blocks = [b for b in response.content
+                           if getattr(b, "type", None) == "text"]
+            tool_calls = [b for b in response.content
+                          if getattr(b, "type", None) == "tool_use"]
+
+            if not tool_calls:
+                # End-of-turn: write the assistant text (concatenated
+                # if multiple blocks). Empty text yields no entry —
+                # the caller can decide whether that's an error.
+                final_text = "".join(b.text for b in text_blocks).strip()
+                if final_text:
+                    await on_writeback(
+                        kind="assistant", body=final_text,
+                    )
+                return {
+                    "thinking": final_text,
+                    "summary": "completed",
+                }
+
+            # Mid-turn: tool calls are present. Write each tool_call,
+            # execute it, write each tool_result, then loop. The
+            # response.content (which may interleave text + tool_use
+            # blocks) goes into the assistant turn so Anthropic sees
+            # its own thinking back on the next call.
+            running_messages.append({
+                "role": "assistant", "content": response.content,
+            })
+            tool_results = []
+            for tc in tool_calls:
+                tool_args = tc.input if isinstance(tc.input, dict) else {}
+                summary_body = f"{tc.name}({json.dumps(tool_args)})"
+                await on_writeback(
+                    kind="tool_call",
+                    body=summary_body,
+                    tool_call_id=tc.id,
+                    tool_name=tc.name,
+                    tool_args=tool_args,
+                )
+                try:
+                    result = await execute_tool(tc.name, tool_args)
+                    content_str = (
+                        json.dumps(result)
+                        if isinstance(result, (dict, list))
+                        else str(result)
+                    )
+                    await on_writeback(
+                        kind="tool_result",
+                        body=content_str,
+                        tool_call_id=tc.id,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": content_str,
+                    })
+                except Exception as exc:
+                    err_str = f"Error: {exc}"
+                    await on_writeback(
+                        kind="tool_result",
+                        body=err_str,
+                        tool_call_id=tc.id,
+                        is_error=True,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": err_str,
+                        "is_error": True,
+                    })
+            running_messages.append({
+                "role": "user", "content": tool_results,
+            })
+
+        raise AIProviderError(
+            f"Conversation agent exceeded maximum turns ({max_turns})"
+        )
 
     async def agent_loop(self, system_prompt: str, user_message: str,
                          tools: list[dict],
