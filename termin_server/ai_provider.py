@@ -62,6 +62,144 @@ _KINDS_USER_ROLE = frozenset({"user", "tool_result", "system_event"})
 _KINDS_ASSISTANT_ROLE = frozenset({"assistant", "tool_call"})
 
 
+# ── v0.9.2 close-out: `purpose` field on tool_call entries ──
+#
+# Per JL's Q2 (today): tool_call entries can carry an optional
+# `purpose` field — a short (6 words ideal, 12-word hard cap with
+# ellipsis truncation) display string the agent supplies for each
+# tool call. Lets chat UIs show a meaningful label without parsing
+# the JSON args.
+#
+# The runtime extracts `purpose` from the agent's tool_use input
+# during materialization, truncates at the hard cap, and persists
+# it on the conversation entry as a top-level field. The agent's
+# remaining args (with `purpose` stripped) go to the tool callback.
+
+_PURPOSE_MAX_WORDS = 12
+
+_PURPOSE_TOOL_DESCRIPTION = (
+    "Short, 6-words-or-less, plain-English description of why you're "
+    "calling this tool — for chat-UI display. Examples: "
+    "'checking the time', 'looking up the order', 'updating the "
+    "ticket status'. Hard truncated at 12 words with ellipsis on "
+    "persistence."
+)
+
+
+def _truncate_purpose(text: str, max_words: int = _PURPOSE_MAX_WORDS) -> str:
+    """Hard-truncate a purpose string to ``max_words`` (default 12)
+    with ellipsis when over. Collapses runs of whitespace via
+    ``str.split()`` default semantics."""
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]) + "..."
+
+
+def _purpose_property() -> dict:
+    """The Anthropic JSON-schema property dict for the `purpose`
+    field. Added to every tool's input_schema by the conversation-
+    mode tool-surface builder so the agent is consistently prompted
+    to supply intent."""
+    return {
+        "type": "string",
+        "description": _PURPOSE_TOOL_DESCRIPTION,
+    }
+
+
+def _add_purpose_to_tool(tool: dict) -> dict:
+    """Return a shallow copy of ``tool`` with `purpose` added to its
+    input_schema's properties (idempotent — no-op if already present).
+    Does NOT mark `purpose` as required; agents are encouraged to
+    supply it but the chat UI falls back to body when absent."""
+    tool = dict(tool)
+    schema = dict(tool.get("input_schema") or {})
+    props = dict(schema.get("properties") or {})
+    if "purpose" not in props:
+        props["purpose"] = _purpose_property()
+    schema["properties"] = props
+    tool["input_schema"] = schema
+    return tool
+
+
+# ── v0.9.2 close-out: Invokes runtime wiring ──
+#
+# `Invokes "<compute_name>"` declarations on an ai-agent compute
+# surface the named compute as an agent tool. v0.9.2 supports
+# default-CEL invokable tools only; LLM and ai-agent invocations
+# from another agent are reserved for future slices (the wiring
+# here doesn't emit tools for non-CEL providers — cleanly ignored).
+
+
+def build_invokable_compute_tools(
+    invokes_list: list[str],
+    computes_lookup: dict,
+) -> list[dict]:
+    """Build Anthropic-shape tool schemas for each compute named in
+    the agent's Invokes declarations. Per the v0.9.2 design §11:
+    tool name = compute snake_name; description from the compute's
+    display_name + first-line directive (when present); input schema
+    derived from the compute's input_params.
+
+    v0.9.2 supports default-CEL providers only. Computes with
+    provider="llm" or "ai-agent" are skipped (logged as future).
+    Unknown invokes (compute not in lookup) are also skipped — the
+    analyzer should have caught this at compile time, but the
+    runtime is forgiving.
+    """
+    tools = []
+    for invoke_name in invokes_list:
+        comp = computes_lookup.get(invoke_name)
+        if comp is None:
+            continue
+        provider = comp.get("provider") or "cel"
+        # Only default-CEL is wired in v0.9.2.
+        if provider not in ("cel", "default-CEL", None, ""):
+            continue
+        name = comp.get("name", {})
+        snake = name.get("snake") if isinstance(name, dict) else invoke_name
+        display = name.get("display") if isinstance(name, dict) else invoke_name
+        directive = (comp.get("directive") or "").strip().splitlines()
+        first_line = directive[0] if directive else ""
+        description = display
+        if first_line:
+            description = f"{display} — {first_line}"
+        properties = {}
+        required = []
+        for param in comp.get("input_params") or ():
+            pname = param.get("name") if isinstance(param, dict) else getattr(param, "name", None)
+            ptype = param.get("type_name") if isinstance(param, dict) else getattr(param, "type_name", None)
+            if not pname:
+                continue
+            # Param types are content-type singulars; v0.9.2 ships
+            # an object-typed schema for each (the agent passes a
+            # record-shaped dict; the runtime evaluates the body
+            # with that dict bound to the param name).
+            properties[pname] = {
+                "type": "object",
+                "description": (
+                    f"The {ptype} record this compute operates on."
+                    if ptype else
+                    f"The {pname} input."
+                ),
+                "additionalProperties": True,
+            }
+            required.append(pname)
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+        tools.append({
+            "name": snake,
+            "description": description,
+            "input_schema": schema,
+        })
+    return tools
+
+
 def _entry_role(kind: str) -> str:
     """Map a Termin entry kind to its Anthropic role."""
     if kind in _KINDS_ASSISTANT_ROLE:
@@ -1152,14 +1290,29 @@ class AIProvider:
             })
             tool_results = []
             for tc in tool_calls:
-                tool_args = tc.input if isinstance(tc.input, dict) else {}
+                raw_args = tc.input if isinstance(tc.input, dict) else {}
+                # v0.9.2 close-out: extract `purpose` (if supplied)
+                # before passing args to the tool. The runtime
+                # truncates per spec and persists on the tool_call
+                # entry; the tool itself doesn't see `purpose`.
+                purpose_raw = raw_args.get("purpose") if isinstance(raw_args, dict) else None
+                tool_args = {
+                    k: v for k, v in raw_args.items() if k != "purpose"
+                } if isinstance(raw_args, dict) else {}
                 summary_body = f"{tc.name}({json.dumps(tool_args)})"
+                writeback_kwargs = {
+                    "tool_call_id": tc.id,
+                    "tool_name": tc.name,
+                    "tool_args": tool_args,
+                }
+                if purpose_raw:
+                    writeback_kwargs["purpose"] = _truncate_purpose(
+                        str(purpose_raw)
+                    )
                 await on_writeback(
                     kind="tool_call",
                     body=summary_body,
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
-                    tool_args=tool_args,
+                    **writeback_kwargs,
                 )
                 try:
                     result = await execute_tool(tc.name, tool_args)

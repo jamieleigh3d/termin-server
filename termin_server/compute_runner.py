@@ -641,10 +641,26 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
 
     # Build tools
     agent_tools = build_agent_tools(accesses, ctx.content_lookup)
+    # v0.9.2 close-out: surface author-declared computes as agent
+    # tools per `Invokes "<X>"` declarations. CEL only in v0.9.2.
+    invokes_list = list(comp.get("invokes") or [])
+    invokable_tools = []
+    if invokes_list and ctx.compute_lookup:
+        from .ai_provider import build_invokable_compute_tools
+        invokable_tools = build_invokable_compute_tools(
+            invokes_list, ctx.compute_lookup,
+        )
     if is_conv_mode:
         # No set_output on conversation mode — the agent communicates
         # by ending its turn with text. Per §11.5 + L7 design.
-        all_tools = agent_tools
+        # v0.9.2 close-out: every tool gets a `purpose` schema field
+        # so the agent is consistently prompted to supply intent for
+        # chat-UI display.
+        from .ai_provider import _add_purpose_to_tool
+        all_tools = [
+            _add_purpose_to_tool(t)
+            for t in (agent_tools + invokable_tools)
+        ]
         # Per §11.3, append the refusal marker so the model knows
         # system.refuse is reachable.
         system_msg = (
@@ -654,7 +670,7 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
         ).strip()
     else:
         set_output = _build_agent_set_output(comp, ctx.content_lookup)
-        all_tools = agent_tools + [set_output]
+        all_tools = agent_tools + invokable_tools + [set_output]
 
     # v0.9 Phase 3 slice (e): refusal capture state. Mutated by
     # _execute_tool when the agent calls system_refuse; consulted
@@ -766,6 +782,72 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                     {"role": "service", "scopes": list(ctx.scope_for_content_verb(cname, "update") or [])},
                     ctx.sm_lookup, ctx.terminator, ctx.event_bus)
                 return result
+
+            elif tool_name in invokes_list:
+                # v0.9.2 close-out: agent invokes a declared compute
+                # as a tool. Resolve via ctx.compute_lookup, evaluate
+                # the CEL body with tool_args bound (and the param's
+                # named slot, when one is declared), return the
+                # resulting input record (Transform/Reduce-shape
+                # convention) to the agent.
+                target = ctx.compute_lookup.get(tool_name) if ctx.compute_lookup else None
+                if target is None:
+                    return {"error": f"Invoked compute '{tool_name}' not found"}
+                provider = target.get("provider") or "cel"
+                if provider not in ("cel", "default-CEL", None, ""):
+                    return {"error": (
+                        f"Invokes wiring for provider '{provider}' is "
+                        f"reserved for future slices; v0.9.2 supports "
+                        f"default-CEL only."
+                    )}
+                body_lines = target.get("body_lines") or []
+                if not body_lines:
+                    return {"error": f"Compute '{tool_name}' has no body"}
+                cel_body = body_lines[0]
+                # Build the eval context: top-level keys are the
+                # compute's input param names (typically named after
+                # the content singular), with the agent-supplied
+                # arg dict as the value. The body mutates that dict
+                # (Transform/Reduce convention) and we return it.
+                eval_ctx = {}
+                for param in target.get("input_params") or ():
+                    pname = (
+                        param.get("name") if isinstance(param, dict)
+                        else getattr(param, "name", None)
+                    )
+                    if not pname:
+                        continue
+                    eval_ctx[pname] = (
+                        tool_input.get(pname)
+                        if isinstance(tool_input, dict) and pname in tool_input
+                        else (tool_input if isinstance(tool_input, dict) else {})
+                    )
+                # Also flatten top-level args into the eval context
+                # so CEL bodies that reference args by name (not via
+                # the param record) still work.
+                if isinstance(tool_input, dict):
+                    for k, v in tool_input.items():
+                        if k not in eval_ctx:
+                            eval_ctx[k] = v
+                try:
+                    expr_result = ctx.expr_eval.evaluate(cel_body, eval_ctx)
+                except Exception as exc:
+                    return {"error": f"Invoked compute failed: {exc}"}
+                # Return the mutated input record (the convention
+                # for Transform/Reduce shapes). When the body is a
+                # pure expression returning a value (no mutation),
+                # surface that as `value`.
+                output = {}
+                for param in target.get("output_params") or ():
+                    pname = (
+                        param.get("name") if isinstance(param, dict)
+                        else getattr(param, "name", None)
+                    )
+                    if pname and pname in eval_ctx:
+                        output[pname] = eval_ctx[pname]
+                if not output:
+                    output = {"value": expr_result}
+                return output
 
             else:
                 return {"error": f"Unknown tool: {tool_name}"}

@@ -776,3 +776,319 @@ class TestAgentChatbotV092EndToEnd:
         assert [e["kind"] for e in entries] == ["user", "assistant"]
         assert entries[1]["type"] == "refusal"
         assert "fabricating" in entries[1]["body"]
+
+
+# ── v0.9.2 final close-out: `purpose` field on tool_call entries ──
+#
+# Per the original v0.9.2 spec (§11.5 + JL's Q2 from earlier today):
+# tool_call entries can carry an optional `purpose` field — a short
+# (6 words ideal, 12-word hard cap with ellipsis truncation) display
+# string the agent supplies for each tool call. Lets chat UIs show
+# a meaningful label without parsing the JSON args.
+
+
+class TestPurposeFieldTruncation:
+    """Per spec: 6 words ideal, hard cap at 12 words with ellipsis."""
+
+    def test_under_12_words_passes_through_unchanged(self):
+        from termin_server.ai_provider import _truncate_purpose
+        assert _truncate_purpose("checking the time") == "checking the time"
+        # Exactly 12 words still passes through.
+        twelve = " ".join(f"w{i}" for i in range(12))
+        assert _truncate_purpose(twelve) == twelve
+
+    def test_thirteen_or_more_words_truncates_with_ellipsis(self):
+        from termin_server.ai_provider import _truncate_purpose
+        thirteen = " ".join(f"w{i}" for i in range(13))
+        out = _truncate_purpose(thirteen)
+        # First 12 words + ellipsis (no trailing space before).
+        assert out == " ".join(f"w{i}" for i in range(12)) + "..."
+
+    def test_empty_returns_empty(self):
+        from termin_server.ai_provider import _truncate_purpose
+        assert _truncate_purpose("") == ""
+
+    def test_handles_excess_whitespace(self):
+        """Word count uses split() default — collapses runs of whitespace."""
+        from termin_server.ai_provider import _truncate_purpose
+        out = _truncate_purpose("  checking   the  time  ")
+        assert out == "checking the time"
+
+
+class TestPurposeFieldOnToolCallEntry:
+    """End-to-end: when the conversation-mode loop writes a tool_call
+    entry, the `purpose` value the agent supplied (if any) lands on
+    the persisted entry, truncated per spec."""
+
+    def test_purpose_persists_when_supplied(self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path, with_tool=True)
+
+        class _PurposefulLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_event=None, max_turns=20,
+            ):
+                await on_writeback(
+                    kind="tool_call",
+                    body="current_time({})",
+                    tool_call_id="toolu_p1",
+                    tool_name="current_time",
+                    tool_args={},
+                    purpose="checking the time",
+                )
+                tool_out = await execute_tool("current_time", {})
+                await on_writeback(
+                    kind="tool_result",
+                    body=json.dumps(tool_out),
+                    tool_call_id="toolu_p1",
+                )
+                await on_writeback(
+                    kind="assistant", body="It's 10am.",
+                )
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_PurposefulLegacy())}
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "purpose"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "what time?"})
+            time.sleep(0.5)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        kinds = [e["kind"] for e in entries]
+        assert kinds == [
+            "user", "tool_call", "tool_result", "assistant",
+        ], entries
+        tc = entries[1]
+        assert tc.get("purpose") == "checking the time"
+
+    def test_purpose_absent_when_not_supplied(self, tmp_path):
+        """The classic L7.3 behavior is unchanged: absent purpose is
+        not added as null — the field is omitted from the entry."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path, with_tool=True)
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_ToolUsingStubLegacy())}
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "no purpose"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "what time?"})
+            time.sleep(0.5)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        tc = entries[1]
+        assert tc["kind"] == "tool_call"
+        assert "purpose" not in tc, (
+            f"purpose should be omitted when not supplied; got {tc!r}"
+        )
+
+
+# ── v0.9.2 final close-out: Invokes runtime wiring ──
+#
+# Per the original v0.9.2 §12 / §16 spec: `Invokes "<compute_name>"`
+# on an ai-agent compute makes the named compute callable as an
+# agent tool. The tool's input schema is built from the compute's
+# input params; tool dispatch evaluates the compute (CEL expression
+# body, via the symbol environment built from tool_args).
+#
+# v0.9.2 supports default-CEL invokable tools only. Invoking an
+# `llm` or `ai-agent` compute as a tool is reserved for future
+# slices.
+
+
+class TestBuildInvokableComputeTools:
+    """Per §11.4 / §16 in the v0.9.2 design doc: tool schema per
+    declared Invokes entry."""
+
+    def test_empty_invokes_returns_empty_list(self):
+        from termin_server.ai_provider import build_invokable_compute_tools
+        assert build_invokable_compute_tools([], {}) == []
+
+    def test_unknown_invokes_skipped(self):
+        from termin_server.ai_provider import build_invokable_compute_tools
+        out = build_invokable_compute_tools(["nonexistent"], {})
+        assert out == [], out
+
+    def test_cel_compute_with_one_param_yields_tool(self):
+        from termin_server.ai_provider import build_invokable_compute_tools
+        computes_lookup = {
+            "current_time": {
+                "name": {"snake": "current_time", "display": "current_time"},
+                "provider": "cel",
+                "input_params": [{"name": "query", "type_name": "text"}],
+                "directive": None,
+            },
+        }
+        out = build_invokable_compute_tools(["current_time"], computes_lookup)
+        assert len(out) == 1
+        tool = out[0]
+        assert tool["name"] == "current_time"
+        assert "input_schema" in tool
+        # The compute's `query` param surfaces as a property.
+        assert "query" in tool["input_schema"]["properties"]
+
+    def test_non_cel_compute_skipped(self):
+        """Invoking llm or ai-agent computes as tools is reserved
+        for future slices; v0.9.2 supports default-CEL only."""
+        from termin_server.ai_provider import build_invokable_compute_tools
+        computes_lookup = {
+            "agent_x": {
+                "name": {"snake": "agent_x", "display": "agent_x"},
+                "provider": "ai-agent",
+                "input_params": [],
+                "directive": "you are an agent",
+            },
+        }
+        out = build_invokable_compute_tools(["agent_x"], computes_lookup)
+        assert out == [], out
+
+
+class TestInvokesEndToEnd:
+    """End-to-end: agent compute with `Invokes "current_time"` can
+    actually call current_time as a tool, gets back the CEL eval
+    result, and the tool_call/tool_result entries land on the
+    conversation field with full linkage."""
+
+    def test_agent_invokes_cel_compute_and_gets_result(self, tmp_path):
+        """The fixture (`_compile_agent_chatbot_with_invokes`) builds
+        an agent_chatbot-shaped app that declares a `current_time`
+        Compute and an `Invokes "current_time"` line on `reply`. The
+        stub agent calls current_time; the runtime evaluates the CEL
+        body and returns the result; the auto-write-back captures
+        both the tool_call and the tool_result with parent_id linkage."""
+        from fastapi.testclient import TestClient
+
+        # Build a small program with an Invokable CEL compute.
+        from termin import peg_parser, analyzer, lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        source = '''Application: Invokes Test
+  Description: v0.9.2 Invokes runtime wiring fixture
+Id: 7e8c1b2e-8f4a-4b1c-9d8e-2f5a3b7c8d99
+
+Identity:
+  Scopes are "chat.use"
+  Anonymous has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, defaults to "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads.conversation
+
+Compute called "current_time":
+  Transform: takes a chat_thread, produces a chat_thread
+  `"2026-05-04T10:00:00Z"`
+  Anyone with "chat.use" can execute this
+
+Compute called "reply":
+  Provider is "ai-agent"
+  Trigger on event "chat_threads.conversation.appended" where `appended_entry.kind == "user"`
+  Conversation is chat_threads.conversation
+  Invokes "current_time"
+  Anyone with "chat.use" can execute this
+  Audit level: actions
+  Anyone with "chat.use" can audit
+  Directive is ```
+    Use the current_time tool when asked about time.
+  ```
+
+As an anonymous, I want to chat:
+  Show a page called "Chat"
+'''
+        program, perr = peg_parser.parse_peg(source)
+        assert perr.ok, perr.format()
+        aerr = analyzer.analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower.lower(program)
+        ir_json = serialize_ir(spec)
+        db_path = str(tmp_path / "invokes_test.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+
+        captured_tools = {}
+
+        class _InvokesStubLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_event=None, max_turns=20,
+            ):
+                # Verify current_time is in the tool surface.
+                captured_tools["names"] = [t["name"] for t in tools]
+                # Call it with an arg.
+                await on_writeback(
+                    kind="tool_call",
+                    body='current_time({"query":"now"})',
+                    tool_call_id="toolu_inv_1",
+                    tool_name="current_time",
+                    tool_args={"query": "now"},
+                    purpose="checking the time",
+                )
+                result = await execute_tool(
+                    "current_time", {"query": "now"})
+                captured_tools["result"] = result
+                await on_writeback(
+                    kind="tool_result",
+                    body=str(result),
+                    tool_call_id="toolu_inv_1",
+                )
+                await on_writeback(
+                    kind="assistant",
+                    body="The time is 10am.",
+                )
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_InvokesStubLegacy())}
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "invokes"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "what time?"})
+            time.sleep(0.5)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        # current_time was in the tool surface.
+        assert "current_time" in captured_tools.get("names", []), (
+            f"current_time tool not surfaced; got "
+            f"{captured_tools.get('names')!r}"
+        )
+        # The compute returned its CEL result.
+        assert captured_tools.get("result"), captured_tools
+        # The four expected entries landed.
+        kinds = [e["kind"] for e in entries]
+        assert kinds == [
+            "user", "tool_call", "tool_result", "assistant",
+        ], entries
+        # Purpose persists.
+        assert entries[1].get("purpose") == "checking the time"

@@ -606,7 +606,7 @@ async def _do_append(
     # other kinds reserve the field for later. No validation — the
     # field passes through to storage as whatever the caller supplied.
     for k in ("type", "source", "tool_call_id", "parent_id", "tool_name",
-              "tool_args", "attachments"):
+              "tool_args", "attachments", "purpose"):
         if k in payload:
             entry[k] = payload[k]
 
