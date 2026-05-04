@@ -475,28 +475,211 @@ _CANONICAL_KINDS = frozenset({
 })
 
 
+# v0.9.2 L3/L4: structured exception types so the WS frame handler
+# can map validation/permission failures to error frames without
+# reaching for FastAPI's HTTPException class. The REST wrapper
+# translates these into HTTP status codes; the WS dispatcher
+# translates them into structured error frames. Same helper, two
+# transports — neither one depends on the other's framing.
+class AppendValidationError(Exception):
+    """Body shape problem (invalid kind, missing body, malformed JSON)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class AppendNotFoundError(Exception):
+    """Parent record doesn't exist or row-filter excludes it."""
+
+    def __init__(self, message: str = "Not found") -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def _do_append(
+    ctx,
+    *,
+    content_ref: str,
+    key_val,
+    field_name: str,
+    payload: dict,
+    user: dict | None,
+    row_filter: dict | None = None,
+) -> dict:
+    """Shared append logic — used by both the REST endpoint and the
+    WebSocket frame handler.
+
+    Validates the payload, loads the parent record (404 if absent or
+    if a row_filter excludes it), reads the existing JSON column,
+    builds the new entry with canonical metadata, and writes the
+    updated entry list back via ``update_record``.
+
+    Returns the new entry on success. Raises:
+
+    * :class:`AppendValidationError` — payload shape problem (caller
+      maps to HTTP 400 / WS error frame with code "validation_error").
+    * :class:`AppendNotFoundError` — record absent or row-filter
+      rejected (caller maps to HTTP 404 / WS "not_found").
+
+    Event firing on append (``<content>.<field>.appended``) is L5's
+    job; this helper passes ``event_bus=None`` to ``update_record``
+    on the column write so the L5 hook can wire up cleanly.
+
+    The shape is `kwargs-only` after ``ctx`` to keep the helper's
+    call sites readable when they pass mostly-static metadata.
+    """
+    from datetime import datetime, timezone
+
+    if not key_val:
+        raise AppendValidationError("Missing record id")
+    if not isinstance(payload, dict):
+        raise AppendValidationError("Body must be a JSON object")
+
+    kind = payload.get("kind", "")
+    if kind not in _CANONICAL_KINDS:
+        raise AppendValidationError(
+            f"Invalid kind '{kind}'. Must be one of: {sorted(_CANONICAL_KINDS)}"
+        )
+    body_text = payload.get("body")
+    if body_text is None or body_text == "":
+        raise AppendValidationError("body is required")
+
+    db = await get_db(ctx.db_path)
+    db.row_factory = sqlite3.Row
+    try:
+        record = await get_record(db, content_ref, key_val)
+    except HTTPException as e:
+        # Storage layer raises HTTPException(404) on missing — translate
+        # to our transport-neutral exception so the caller maps it
+        # back to its native shape (HTTP 404 or WS error frame).
+        if e.status_code == 404:
+            raise AppendNotFoundError("Not found") from None
+        raise
+
+    # Row filter: their_own ownership check on the parent record.
+    # Mirrors what the runtime does for view/update/delete on owned
+    # content (BRD #3 §3.7). Same 404 surface as a missing record so
+    # ownership doesn't leak existence.
+    if row_filter and row_filter.get("kind") == "ownership":
+        user_id = (user or {}).get("id") if user else None
+        # The user dict is the legacy shape — `the_user.id` carries
+        # the principal id under the v0.9 layout. Fall back to the
+        # top-level `id` for unit-test friendliness.
+        if not user_id and isinstance(user, dict):
+            the_user = user.get("the_user") or {}
+            user_id = the_user.get("id")
+        owner_field = row_filter.get("field")
+        if owner_field and record.get(owner_field) != user_id:
+            raise AppendNotFoundError("Not found")
+
+    # Read existing entries (TEXT column holding a JSON array).
+    raw = record.get(field_name)
+    if raw in (None, ""):
+        entries = []
+    else:
+        try:
+            entries = json.loads(raw)
+            if not isinstance(entries, list):
+                entries = []
+        except (TypeError, ValueError):
+            entries = []
+
+    # Build the new entry with canonical metadata. Optional
+    # caller-supplied fields pass through unchanged; runtime owns
+    # id, created_at, appended_by_principal_id.
+    user_dict = user or {}
+    appender_id = user_dict.get("id", "")
+    if not appender_id and isinstance(user_dict, dict):
+        the_user = user_dict.get("the_user") or {}
+        appender_id = the_user.get("id", "")
+    entry = {
+        "id": _uuid7_str(),
+        "kind": kind,
+        "body": body_text,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "appended_by_principal_id": appender_id,
+    }
+    for k in ("source", "tool_call_id", "parent_id", "tool_name",
+              "tool_args", "attachments"):
+        if k in payload:
+            entry[k] = payload[k]
+
+    entries.append(entry)
+    updated_record = await update_record(
+        db, content_ref, key_val,
+        {field_name: json.dumps(entries)},
+        terminator=ctx.terminator,
+        event_bus=None,   # the standard _updated event is suppressed —
+                          # L5 publishes the field-specific .appended event
+                          # below instead, so subscribers get one signal,
+                          # not two.
+    )
+
+    # v0.9.2 L5: publish `content.<name>.<field>.appended` so listener
+    # computes (Trigger on event "X.Y.appended" where ...) and any WS
+    # subscribers receive the new entry. Channel is field-specific so
+    # subscribers can react to conversation activity on one field
+    # without false positives from other column updates. Lives in the
+    # shared helper (not the REST route) so the WS frame handler (L4)
+    # also fires the event without any duplication.
+    if ctx.event_bus is not None:
+        await ctx.event_bus.publish({
+            "type": f"{content_ref}_{field_name}_appended",
+            "channel_id": f"content.{content_ref}.{field_name}.appended",
+            "content_name": content_ref,
+            "field_name": field_name,
+            "record_id": key_val,
+            "record": updated_record,
+            "appended_entry": entry,
+            "triggered_at": entry["created_at"],
+            "invoked_by_principal_id": entry["appended_by_principal_id"],
+            "trigger_kind": "crud-append",
+        })
+
+    # v0.9.2 L5: dispatch listener computes that triggered on this
+    # event. Mirrors the per-CRUD-verb dispatch path used by
+    # create/update/delete — `run_event_handlers` is the existing
+    # entrypoint that walks `ir.events` (When-rules) and
+    # `ir.computes` with `Trigger on event "..."`. The trigger
+    # string for an append is `<content>.<field>.appended`.
+    if hasattr(ctx, "run_event_handlers"):
+        await ctx.run_event_handlers(
+            db, content_ref, f"{field_name}.appended", updated_record,
+            appended_entry=entry,
+        )
+
+    return entry
+
+
 def _make_append_route(app, ctx, path, cr, sc, field_name, row_filter=None):
     """v0.9.2 L3: register a POST /<resource>/{id}/<field>:append handler.
 
-    The handler:
-      1. Loads the parent record by id (404 if not found).
-      2. (If row_filter) checks ownership against the invoking principal.
-      3. Validates the request body — `kind` must be canonical, `body`
-         required.
-      4. Generates a UUIDv7 entry id + ISO timestamp + appended_by_principal_id.
-      5. Reads the existing JSON column value (or [] if null).
-      6. Appends the new entry.
-      7. Writes the column back via update_record.
-      8. Returns 201 with the entry.
+    Thin wrapper around :func:`_do_append`. The shared helper carries
+    the validation, row-filter, RMW, and entry-construction logic so
+    the REST endpoint and the WebSocket frame handler (L4) cannot
+    drift apart.
 
-    Event firing on append (`<content>.<field>.appended`) is L5's job.
-    WebSocket frame parity is L4's job. This handler ships only the
-    REST surface and the storage round-trip.
+    Side effect: stashes ``(content_ref, field_name) →
+    {scope, row_filter}`` on ``ctx._append_targets`` so the WS frame
+    handler can resolve the same metadata when an inbound frame
+    addresses an arbitrary content+field pair without a separate
+    route registration.
     """
-    from datetime import datetime, timezone
-    from fastapi import HTTPException
-
     deps = [Depends(ctx.require_scope(sc))] if sc else []
+
+    # Per-(content, field) registration so the WS append-frame handler
+    # can look up the same scope/row_filter the REST endpoint applies.
+    # Keyed by (content_snake, field_snake); value is a dict of the
+    # route-level metadata. Initialized lazily so multiple register-
+    # passes (e.g., test harnesses that boot the app twice) don't
+    # error.
+    if not hasattr(ctx, "_append_targets"):
+        ctx._append_targets = {}
+    ctx._append_targets[(cr, field_name)] = {
+        "scope": sc,
+        "row_filter": row_filter,
+    }
 
     @app.post(path, status_code=201, dependencies=deps)
     async def append_route(request: Request, _cr=cr, _fn=field_name, _rf=row_filter):
@@ -504,109 +687,27 @@ def _make_append_route(app, ctx, path, cr, sc, field_name, row_filter=None):
         # the canonical APPEND path. If a future variant adds more,
         # take the first.
         key_val = list(request.path_params.values())[0] if request.path_params else None
-        if not key_val:
-            raise HTTPException(status_code=400, detail="Missing record id")
 
         try:
             payload = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body")
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Body must be a JSON object")
 
-        kind = payload.get("kind", "")
-        if kind not in _CANONICAL_KINDS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid kind '{kind}'. Must be one of: {sorted(_CANONICAL_KINDS)}",
+        user = ctx.get_current_user(request)
+        try:
+            entry = await _do_append(
+                ctx,
+                content_ref=_cr,
+                key_val=key_val,
+                field_name=_fn,
+                payload=payload,
+                user=user,
+                row_filter=_rf,
             )
-        body_text = payload.get("body")
-        if body_text is None or body_text == "":
-            raise HTTPException(status_code=400, detail="body is required")
-
-        db = await get_db(ctx.db_path)
-        db.row_factory = sqlite3.Row
-        record = await get_record(db, _cr, key_val)
-
-        # Row filter: their_own ownership check on the parent record.
-        # Mirrors what the runtime does for view/update/delete on
-        # owned content (BRD #3 §3.7).
-        if _rf and _rf.get("kind") == "ownership":
-            user = ctx.get_current_user(request)
-            user_id = user.get("id") if user else None
-            owner_field = _rf.get("field")
-            if owner_field and record.get(owner_field) != user_id:
-                raise HTTPException(status_code=404, detail="Not found")
-
-        # Read existing entries (TEXT column holding a JSON array).
-        raw = record.get(_fn)
-        if raw in (None, ""):
-            entries = []
-        else:
-            try:
-                entries = json.loads(raw)
-                if not isinstance(entries, list):
-                    entries = []
-            except (TypeError, ValueError):
-                entries = []
-
-        # Build the new entry with canonical metadata. Optional
-        # caller-supplied fields pass through unchanged; runtime
-        # owns id, created_at, appended_by_principal_id.
-        user = ctx.get_current_user(request) or {}
-        entry = {
-            "id": _uuid7_str(),
-            "kind": kind,
-            "body": body_text,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "appended_by_principal_id": user.get("id", ""),
-        }
-        for k in ("source", "tool_call_id", "parent_id", "tool_name",
-                  "tool_args", "attachments"):
-            if k in payload:
-                entry[k] = payload[k]
-
-        entries.append(entry)
-        updated_record = await update_record(
-            db, _cr, key_val,
-            {_fn: json.dumps(entries)},
-            terminator=ctx.terminator,
-            event_bus=None,   # the standard _updated event is suppressed —
-                              # L5 publishes the field-specific .appended event
-                              # below instead, so subscribers get one signal,
-                              # not two.
-        )
-
-        # v0.9.2 L5: publish `content.<name>.<field>.appended` so listener
-        # computes (Trigger on event "X.Y.appended" where ...) and any WS
-        # subscribers receive the new entry. Channel is field-specific so
-        # subscribers can react to conversation activity on one field
-        # without false positives from other column updates.
-        if ctx.event_bus is not None:
-            await ctx.event_bus.publish({
-                "type": f"{_cr}_{_fn}_appended",
-                "channel_id": f"content.{_cr}.{_fn}.appended",
-                "content_name": _cr,
-                "field_name": _fn,
-                "record_id": key_val,
-                "record": updated_record,
-                "appended_entry": entry,
-                "triggered_at": entry["created_at"],
-                "invoked_by_principal_id": entry["appended_by_principal_id"],
-                "trigger_kind": "crud-append",
-            })
-
-        # v0.9.2 L5: dispatch listener computes that triggered on this
-        # event. Mirrors the per-CRUD-verb dispatch path used by
-        # create/update/delete — `run_event_handlers` is the existing
-        # entrypoint that walks `ir.events` (When-rules) and
-        # `ir.computes` with `Trigger on event "..."`. The trigger
-        # string for an append is `<content>.<field>.appended`.
-        if hasattr(ctx, "run_event_handlers"):
-            await ctx.run_event_handlers(
-                db, _cr, f"{_fn}.appended", updated_record,
-                appended_entry=entry,
-            )
+        except AppendValidationError as e:
+            raise HTTPException(status_code=400, detail=e.message)
+        except AppendNotFoundError as e:
+            raise HTTPException(status_code=404, detail=e.message)
 
         return entry
 
