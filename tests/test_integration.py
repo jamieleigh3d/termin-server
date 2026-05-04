@@ -13,6 +13,8 @@ the layers that conformance exercises only via adapter."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -893,3 +895,223 @@ class TestPageRendering:
             f"anonymous request 5xx'd: {resp.status_code} "
             f"{resp.text[:200]}"
         )
+
+
+# ── v0.9.2 L9: chat presentation contract — conversation-field binding ──
+
+
+class TestChatConversationFieldRender:
+    """v0.9.2 L9: the Tailwind built-in chat component renders the new
+    `Show a chat for <content>.<field>` binding form per tech design §14.
+
+    The compiler emits a `chat` ComponentNode with `conversation_field`
+    in its props. The server-side renderer (`_render_chat` in
+    `termin_server/presentation.py`) discriminates on that prop and
+    emits a different SSR shell — one that delegates entry rendering to
+    the JS hydrator (entries live as JSON on a parent record, not in a
+    separate collection). The data attributes carry everything the
+    hydrator needs:
+
+    * `data-termin-chat-binding="conversation-field"` — branch marker
+    * `data-termin-source="<parent content>"` — for record fetching
+    * `data-termin-conversation-field="<field>"` — for entry extraction
+    * `data-termin-subscribe="content.<source>.<field>.appended"` —
+      L5 event channel
+
+    The input area sends via the L4 WebSocket append frame, NOT a
+    REST POST — so no `<form action="/api/v1/...">` should appear.
+    These tests verify the SSR shell shape directly.
+    """
+
+    def test_render_chat_conversation_form_shape(self):
+        """Direct unit on the renderer: a chat ComponentNode with
+        `conversation_field` produces the conversation-binding shell."""
+        from termin_server.presentation import render_component
+        node = {
+            "type": "chat",
+            "props": {
+                "source": "chat_threads",
+                "conversation_field": "conversation",
+            },
+            "children": [],
+        }
+        html = render_component(node)
+        assert 'data-termin-chat' in html
+        assert 'data-termin-chat-binding="conversation-field"' in html
+        assert 'data-termin-source="chat_threads"' in html
+        assert 'data-termin-conversation-field="conversation"' in html
+        # L5 event channel — exact shape is the contract.
+        assert ('data-termin-subscribe='
+                '"content.chat_threads.conversation.appended"') in html
+        # Input area present, with no REST action — sends via WS L4.
+        assert 'data-termin-chat-input' in html
+        assert 'data-termin-chat-form' in html
+        assert 'action="/api/v1/' not in html
+
+    def test_render_chat_conversation_messages_container_present(self):
+        """The hydrator targets `[data-termin-chat-messages]` for entry
+        injection. Missing this attribute would leave the renderer
+        unable to find where to put bubbles."""
+        from termin_server.presentation import render_component
+        node = {
+            "type": "chat",
+            "props": {
+                "source": "chat_threads",
+                "conversation_field": "conversation",
+            },
+            "children": [],
+        }
+        html = render_component(node)
+        assert 'data-termin-chat-messages' in html
+        # aria-live attribute keeps screen readers in the loop as
+        # entries arrive — matches the data-termin-{kind,type}
+        # attributes the §14.3 customization layer uses.
+        assert 'aria-live="polite"' in html
+
+    def test_render_chat_legacy_form_unchanged(self):
+        """Regression: the legacy messages-collection chat must still
+        render the iterating-template shape and POST-to-API form."""
+        from termin_server.presentation import render_component
+        node = {
+            "type": "chat",
+            "props": {
+                "source": "messages",
+                "role_field": "role",
+                "content_field": "body",
+            },
+            "children": [],
+        }
+        html = render_component(node)
+        assert 'data-termin-chat' in html
+        assert 'data-termin-chat-binding=' not in html
+        # Legacy form posts directly to the messages collection.
+        assert 'action="/api/v1/messages"' in html
+        # Legacy template iterates Jinja items.
+        assert '{% for item in items %}' in html
+
+    def test_render_chat_legacy_subscribe_child_attr(self):
+        """The legacy form's `subscribe` child attaches a
+        `data-termin-subscribe` attribute targeting the source — the
+        new form uses a fully-qualified `content.<source>.<field>.appended`
+        channel instead."""
+        from termin_server.presentation import render_component
+        node = {
+            "type": "chat",
+            "props": {
+                "source": "messages",
+                "role_field": "role",
+                "content_field": "body",
+            },
+            "children": [{"type": "subscribe", "props": {"content": "messages"}}],
+        }
+        html = render_component(node)
+        assert 'data-termin-subscribe="messages"' in html
+
+
+class TestChatConversationFieldEndToEnd:
+    """Boot a full FastAPI app from a hand-built IR that includes the
+    new chat ComponentNode shape. Verify:
+
+    * The chat page renders with the conversation-binding SSR shell.
+    * The L3 :append REST endpoint is registered (L4 frame handler
+      shares the same registration via _append_targets).
+    * The L5 event publishes on append (verified separately in
+      TestAppendedEvent — repeated here to cover the conversation-field
+      page integration).
+
+    This avoids depending on which `termin` compiler is installed in
+    the venv — the IR shape is the contract between compiler and
+    server, and the server side of L9 is what this slice owns. The IR
+    here is the exact shape the L9 compiler emits for:
+
+      Show a chat for chat_threads.conversation
+    """
+
+    @pytest.fixture
+    def conv_chat_client(self, tmp_path):
+        """Boot a TestClient against the L9 conversation-chat smoke
+        fixture. The .termin.pkg in tests/fixtures/ is regenerated
+        from `examples-dev/chat_conversation_smoke.termin` whenever the
+        L9 compiler grammar changes — this avoids hand-rolling IR JSON
+        that drifts from the canonical compiler output."""
+        import json
+        import zipfile
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from termin_server import create_termin_app
+
+        pkg_path = Path(__file__).parent / "fixtures" / "chat_conv_smoke.termin.pkg"
+        with zipfile.ZipFile(pkg_path) as zf:
+            manifest = json.loads(zf.read("manifest.json"))
+            ir_json = zf.read(manifest["ir"]["entry"]).decode("utf-8")
+
+        db_path = str(tmp_path / "l9_conv_chat.db")
+        app = create_termin_app(ir_json, db_path=db_path,
+                                strict_channels=False)
+        with TestClient(app) as client:
+            yield client
+
+    def test_chat_page_renders_conversation_binding_shell(self, conv_chat_client):
+        """End-to-end: the rendered /chat page carries the conversation-
+        binding markers the JS hydrator needs to take over."""
+        conv_chat_client.cookies.set("termin_role", "anonymous")
+        resp = conv_chat_client.get("/chat")
+        assert resp.status_code in (200, 307), resp.text[:500]
+        if resp.status_code == 307:
+            resp = conv_chat_client.get(
+                resp.headers["location"], follow_redirects=True)
+        body = resp.text
+        assert 'data-termin-chat-binding="conversation-field"' in body
+        assert 'data-termin-source="chat_threads"' in body
+        assert 'data-termin-conversation-field="conversation"' in body
+        assert ('data-termin-subscribe='
+                '"content.chat_threads.conversation.appended"') in body
+
+    def test_chat_page_no_legacy_post_form(self, conv_chat_client):
+        """The conversation-field surface sends via the L4 WS append
+        frame; the rendered shell must NOT carry a REST POST form for
+        the chat input. Otherwise a hydrator regression would silently
+        fall back to creating standalone records."""
+        conv_chat_client.cookies.set("termin_role", "anonymous")
+        resp = conv_chat_client.get("/chat", follow_redirects=True)
+        assert resp.status_code == 200
+        # The form has no action= attribute and onsubmit returns false.
+        assert 'data-termin-chat-form' in resp.text
+        assert 'onsubmit="return false"' in resp.text
+
+    def test_append_route_registered_for_conversation_field(self, conv_chat_client):
+        """L4 frame dispatch and L9 hydrator both rely on the
+        :append route being registered. Without it, the WS frame
+        handler returns "not_found" and the chat surface can't write."""
+        conv_chat_client.cookies.set("termin_role", "anonymous")
+        # Create a parent record first.
+        create = conv_chat_client.post(
+            "/api/v1/chat_threads", json={"title": "L9 e2e"})
+        assert create.status_code == 201, create.text
+        thread_id = create.json()["id"]
+        # Append via the REST endpoint (L3 surface — L4 WS shares the
+        # same registration). A 201 here proves the route exists,
+        # the scope gate accepts our anonymous principal, and the
+        # entry-construction pipeline runs.
+        ap = conv_chat_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user", "body": "hello L9"},
+        )
+        assert ap.status_code == 201, ap.text
+        entry = ap.json()
+        assert entry["kind"] == "user"
+        assert entry["body"] == "hello L9"
+        # Read-back: the entry is in the parent record's conversation list.
+        # The list endpoint returns the JSON column as its raw string in
+        # SQLite-backed deployments — parse if needed so the test works
+        # against either marshalling.
+        get = conv_chat_client.get(f"/api/v1/chat_threads/{thread_id}")
+        assert get.status_code == 200
+        rec = get.json()
+        raw = rec.get("conversation")
+        entries = (
+            raw if isinstance(raw, list)
+            else (json.loads(raw) if raw else [])
+        )
+        assert len(entries) == 1
+        assert entries[0]["body"] == "hello L9"

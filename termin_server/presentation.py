@@ -625,7 +625,35 @@ def _render_section(node: dict) -> str:
 
 
 def _render_chat(node: dict) -> str:
-    """Render a chat component — scrolling message list with input area."""
+    """Render a chat component.
+
+    Two binding shapes share the same component (per v0.9.2 conversation
+    field type tech design §14):
+
+    1. **Legacy messages-collection binding** — props carry `source`,
+       `role_field`, `content_field`. Entries come from a Content type
+       and are iterated in the SSR template; new entries arrive via
+       `content.<source>.created` events; the input POSTs to
+       ``/api/v1/<source>``.
+    2. **Conversation-field binding (L9)** — props carry `source` (the
+       parent content) plus `conversation_field` (the field name on
+       that content). Entries are stored as a JSON list on the parent
+       record. The JS hydrator fetches the parent record by id, walks
+       the `<field>` list, and renders one bubble per §7.2 entry. New
+       entries arrive via the `content.<source>.<field>.appended` event
+       (L5); the input sends an L4 WebSocket ``append`` frame.
+
+    The shape is discriminated by ``conversation_field`` being present
+    in props.
+    """
+    props = node.get("props", {})
+    if props.get("conversation_field"):
+        return _render_chat_conversation(node)
+    return _render_chat_legacy(node)
+
+
+def _render_chat_legacy(node: dict) -> str:
+    """Render the legacy messages-collection chat binding."""
     props = node.get("props", {})
     source = props.get("source", "")
     role_field = props.get("role_field", "role")
@@ -658,6 +686,75 @@ def _render_chat(node: dict) -> str:
         f'  <div class="border-t p-3" data-termin-chat-input>',
         f'    <form method="post" action="/api/v1/{source}" class="flex space-x-2" data-termin-chat-form>',
         f'      <input type="text" name="{content_field}" placeholder="Type a message..."'
+        f' class="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"'
+        f' autocomplete="off">',
+        f'      <button type="submit"'
+        f' class="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 transition-colors">Send</button>',
+        f'    </form>',
+        f'  </div>',
+        f'</div>',
+    ]
+    return '\n'.join(parts)
+
+
+def _render_chat_conversation(node: dict) -> str:
+    """Render the v0.9.2 L9 conversation-field chat binding.
+
+    The component is an SSR shell — no entries are rendered server-side
+    because the conversation field is JSON on a record, not a separate
+    collection. The JS hydrator owns the lifecycle:
+
+    * On mount, picks up the `data-termin-record-id` (the parent record
+      whose conversation should be displayed) and fetches
+      ``/api/v1/<source>/<id>``.
+    * Walks the entries in the resulting record's `<conversation_field>`
+      column and renders one bubble per §7.2 entry kind/type.
+    * Subscribes to ``content.<source>.<field>.appended`` (L5) and
+      appends new entries with a fade-in.
+    * Sends user messages by writing to the existing record subscription
+      WS as a v0.9.2 L4 ``append`` frame:
+      ``{type: "append", resource: <source>, id: <record_id>,
+         field: <conversation_field>, payload: {kind: "user", body: <text>}}``.
+
+    The data attributes carry everything the hydrator needs; no template
+    iteration variables required (so the page renderer doesn't need to
+    pre-load the record into the SSR context).
+    """
+    props = node.get("props", {})
+    source = props.get("source", "")
+    conv_field = props.get("conversation_field", "")
+    # The parent record id is resolved client-side. The default behaviour
+    # is "the most recent <source> record visible to the user" — the
+    # hydrator handles the fetch. Authors can pin a specific record by
+    # adding a `data-termin-record-id` attribute via a future
+    # presentation knob (out of scope for L9 — see §21 deferrals).
+
+    parts = [
+        f'<div class="flex flex-col h-[600px] bg-white shadow rounded overflow-hidden"'
+        f' data-termin-chat'
+        f' data-termin-chat-binding="conversation-field"'
+        f' data-termin-source="{source}"'
+        f' data-termin-conversation-field="{conv_field}"'
+        f' data-termin-subscribe="content.{source}.{conv_field}.appended">',
+        f'  <div class="flex-1 overflow-y-auto p-4 space-y-3"'
+        f' data-termin-chat-messages'
+        f' aria-live="polite"'
+        f' aria-label="Conversation transcript">',
+        # SSR placeholder — replaced by the hydrator's first render. Carries
+        # the visible-without-JS notice so non-hydrated pages still degrade
+        # to a comprehensible state.
+        f'    <div class="text-sm text-gray-500" data-termin-chat-placeholder>'
+        f'Loading conversation...</div>',
+        f'  </div>',
+        f'  <div class="border-t p-3" data-termin-chat-input>',
+        # No <form action=...>: the L4 WS append frame is the send path.
+        # The submit handler intercepts and routes via Termin.appendTo().
+        # Fallback: if JS is disabled, the form is a no-op (the data-termin
+        # attributes carry everything, and the hydrator owns all writes).
+        f'    <form class="flex space-x-2" data-termin-chat-form'
+        f' onsubmit="return false">',
+        f'      <input type="text" name="body" placeholder="Type a message..."'
+        f' aria-label="Message text"'
         f' class="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"'
         f' autocomplete="off">',
         f'      <button type="submit"'

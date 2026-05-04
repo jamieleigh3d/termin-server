@@ -407,6 +407,17 @@ function hydrateChatComponents() {
     const source = chat.dataset.terminSource;
     if (!source) continue;
 
+    // v0.9.2 L9: branch on the binding shape. Conversation-field chats
+    // (per the v0.9.2 conversation field type tech design §14) bind to a
+    // JSON column on a parent record; messages-collection chats (the
+    // legacy form) bind to a Content type. The two share the wrapper
+    // and the input area but diverge on subscription channel, message
+    // shape, and send path.
+    if (chat.dataset.terminChatBinding === "conversation-field") {
+      hydrateConversationFieldChat(chat);
+      continue;
+    }
+
     const messagesContainer = chat.querySelector("[data-termin-chat-messages]");
     if (!messagesContainer) continue;
 
@@ -574,6 +585,403 @@ function appendChatMessage(container, data, chatEl) {
 
   // Auto-scroll to bottom
   container.scrollTop = container.scrollHeight;
+}
+
+// ── v0.9.2 L9: conversation-field chat ──
+//
+// The Tailwind built-in chat provider for the new
+// `Show a chat for <content>.<field>` binding form. Per the v0.9.2
+// conversation field type tech design §14, this branch:
+//
+// 1. Fetches the parent record (most-recent visible) via the standard
+//    `/api/v1/<source>` listing endpoint, picks one, and reads the
+//    `<conversation_field>` JSON column.
+// 2. Renders one bubble per §7.2 entry, dispatched on `kind` and (for
+//    assistant entries) `type`. Sets data-termin-{kind,type,source,
+//    tool-name} on each entry root so app CSS can override appearance
+//    per the §14.3 customization layer without touching source.
+// 3. Subscribes to `content.<source>.<field>.appended` (L5 event)
+//    and appends new entries with a fade-in animation.
+// 4. Wires the input form to the L4 WebSocket `append` frame; sends
+//    `{type:"append", resource, id, field, payload:{kind:"user", body}}`.
+//
+// Pairs `tool_call` and `tool_result` entries by `tool_call_id` and
+// renders the result as a collapsible inline detail under the call.
+//
+// JL is colorblind: every kind/type distinction also carries a label,
+// icon, position, and aria attribute — color is supplementary, never
+// the only signal.
+function hydrateConversationFieldChat(chat) {
+  const source = chat.dataset.terminSource;
+  const field = chat.dataset.terminConversationField;
+  const messagesContainer = chat.querySelector("[data-termin-chat-messages]");
+  if (!source || !field || !messagesContainer) return;
+
+  // Track the active record id once resolved. The conversation lives on
+  // a record; the hydrator picks one to display. v0.9.2 default:
+  // most-recent visible record. Authors who want a pinned record can
+  // set `data-termin-record-id` on the chat root before hydration.
+  let recordId = chat.dataset.terminRecordId || null;
+
+  // Initial render: load the parent record (creating one if none
+  // exists), walk its conversation list, render entries.
+  resolveActiveRecord(source, recordId).then((rec) => {
+    if (!rec) {
+      renderChatPlaceholder(messagesContainer,
+        "No conversation yet. Send a message to start.");
+      return;
+    }
+    recordId = rec.id;
+    chat.dataset.terminRecordId = String(recordId);
+    const placeholder = messagesContainer.querySelector(
+      "[data-termin-chat-placeholder]");
+    if (placeholder) placeholder.remove();
+    const entries = Array.isArray(rec[field]) ? rec[field] : [];
+    renderConversationEntries(messagesContainer, entries);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }).catch((err) => {
+    renderChatPlaceholder(messagesContainer,
+      "Could not load conversation: " + (err && err.message || err));
+  });
+
+  // Subscribe to the field-specific appended event (L5).
+  const channel = `content.${source}.${field}.appended`;
+  console.log("[Termin] Conversation chat subscribing to:", channel);
+  subscribe(channel, (ch, data) => {
+    if (!data || !data.appended_entry) return;
+    // Filter by record id once the active record is known. Until then,
+    // the first append we see (typically our own) determines it.
+    if (recordId == null) {
+      recordId = data.record_id;
+      chat.dataset.terminRecordId = String(recordId);
+    } else if (data.record_id != null && String(data.record_id) !== String(recordId)) {
+      return;
+    }
+    const placeholder = messagesContainer.querySelector(
+      "[data-termin-chat-placeholder]");
+    if (placeholder) placeholder.remove();
+    appendConversationEntry(messagesContainer, data.appended_entry, /*isLive*/true);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  });
+
+  // Wire the input form to the L4 WS append frame.
+  const form = chat.querySelector("[data-termin-chat-form]");
+  if (form) {
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = form.querySelector("input[name='body']");
+      const body = input && input.value ? String(input.value).trim() : "";
+      if (!body) return;
+      if (recordId == null) {
+        // No record yet — create one synchronously so we have an id to
+        // append against. The default content type usually has a
+        // `title` field; let storage defaults fill the rest.
+        ensureRecord(source).then((rec) => {
+          recordId = rec.id;
+          chat.dataset.terminRecordId = String(recordId);
+          sendAppendFrame(source, recordId, field, {kind: "user", body});
+          input.value = "";
+        }).catch((err) => {
+          console.warn("[Termin] Could not create record for conversation:", err);
+        });
+        return;
+      }
+      sendAppendFrame(source, recordId, field, {kind: "user", body});
+      input.value = "";
+    });
+  }
+}
+
+function renderChatPlaceholder(container, text) {
+  let placeholder = container.querySelector("[data-termin-chat-placeholder]");
+  if (!placeholder) {
+    placeholder = document.createElement("div");
+    placeholder.className = "text-sm text-gray-500";
+    placeholder.setAttribute("data-termin-chat-placeholder", "");
+    container.appendChild(placeholder);
+  }
+  placeholder.textContent = text;
+}
+
+async function resolveActiveRecord(source, pinnedId) {
+  if (pinnedId != null) {
+    const r = await fetch(`/api/v1/${source}/${pinnedId}`);
+    if (r.ok) return await r.json();
+  }
+  const r = await fetch(`/api/v1/${source}`);
+  if (!r.ok) return null;
+  const records = await r.json();
+  if (!Array.isArray(records) || records.length === 0) return null;
+  // Most-recent visible record. The list endpoint orders by id (UUIDv7
+  // for content with that default; otherwise insertion order). The last
+  // entry in the array is the latest in either case.
+  return records[records.length - 1];
+}
+
+async function ensureRecord(source) {
+  const r = await fetch(`/api/v1/${source}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({}),
+  });
+  if (!r.ok) throw new Error(`Could not create ${source}: ${r.status}`);
+  return await r.json();
+}
+
+function sendAppendFrame(resource, id, field, payload) {
+  // The L4 append frame doesn't ride the standard {v, ch, op, ref}
+  // envelope — the AppendFrameInterceptor on the server matches on
+  // top-level `type === "append"` (per tech design §8.3). We send raw.
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    console.warn("[Termin] WS not connected; cannot send append");
+    return null;
+  }
+  const ref = `ref-${++state.refCounter}`;
+  state.ws.send(JSON.stringify({
+    type: "append",
+    ref,
+    resource,
+    id,
+    field,
+    payload,
+  }));
+  return ref;
+}
+
+function renderConversationEntries(container, entries) {
+  // Pair tool_calls with their tool_results so collapsibles can render
+  // inline. Pair key: tool_call_id. Unmatched tool_results render
+  // standalone with a "(orphan)" label.
+  const resultByCallId = new Map();
+  for (const e of entries) {
+    if (e && e.kind === "tool_result" && e.tool_call_id) {
+      resultByCallId.set(e.tool_call_id, e);
+    }
+  }
+  for (const e of entries) {
+    if (e && e.kind === "tool_result" && e.tool_call_id &&
+        resultByCallId.get(e.tool_call_id) === e) {
+      // Skip — rendered inline under its tool_call.
+      continue;
+    }
+    appendConversationEntry(container, e, /*isLive*/false,
+      e.kind === "tool_call" ? resultByCallId.get(e.tool_call_id) : null);
+  }
+}
+
+function appendConversationEntry(container, entry, isLive, pairedResult) {
+  if (!entry || typeof entry !== "object") return;
+  const kind = entry.kind || "user";
+  const type = entry.type || "";
+  const wrapper = document.createElement("div");
+  wrapper.setAttribute("data-termin-chat-entry", "");
+  wrapper.setAttribute("data-termin-kind", kind);
+  if (type) wrapper.setAttribute("data-termin-type", type);
+  if (entry.source) wrapper.setAttribute("data-termin-source", entry.source);
+  if (entry.tool_name) wrapper.setAttribute("data-termin-tool-name", entry.tool_name);
+  if (entry.id) wrapper.setAttribute("data-termin-entry-id", entry.id);
+  if (isLive) wrapper.classList.add("termin-fade-in");
+
+  const renderer = CONVERSATION_ENTRY_RENDERERS[kind] || _renderEntryUnknown;
+  renderer(wrapper, entry, pairedResult);
+  container.appendChild(wrapper);
+}
+
+// Per-kind renderers. Each fills `wrapper` with the entry's HTML.
+// Color is one signal among many — every distinction also carries a
+// label/icon/position/aria so the surface is comprehensible to
+// colorblind reviewers (per the universal CLAUDE.md UI rule).
+function _renderEntryUser(wrapper, entry) {
+  wrapper.className = "flex justify-end";
+  if (entry.id) wrapper.classList.add("termin-fade-in-prep");
+  const bubble = document.createElement("div");
+  bubble.className = "bg-blue-500 text-white rounded-lg px-4 py-2 max-w-[70%]";
+  bubble.setAttribute("aria-label", "User message");
+  const label = document.createElement("div");
+  label.className = "text-xs opacity-70 mb-1";
+  label.textContent = "You";
+  const body = document.createElement("div");
+  body.textContent = entry.body || "";
+  bubble.appendChild(label);
+  bubble.appendChild(body);
+  _renderAttachments(bubble, entry.attachments);
+  wrapper.appendChild(bubble);
+}
+
+function _renderEntryAssistant(wrapper, entry) {
+  wrapper.className = "flex justify-start";
+  const isRefusal = entry.type === "refusal";
+  const bubble = document.createElement("div");
+  bubble.className = isRefusal
+    ? "bg-amber-50 border border-amber-300 text-amber-900 rounded-lg px-4 py-2 max-w-[70%]"
+    : "bg-gray-200 text-gray-800 rounded-lg px-4 py-2 max-w-[70%]";
+  bubble.setAttribute("aria-label",
+    isRefusal ? "Assistant refusal" : "Assistant message");
+  const label = document.createElement("div");
+  label.className = "text-xs opacity-70 mb-1 flex items-center gap-1";
+  if (isRefusal) {
+    // Color is one signal; the explicit "Refused" label + warning glyph
+    // + amber-bordered bubble shape together convey the distinction
+    // without depending on color perception.
+    const icon = document.createElement("span");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "⚠";
+    label.appendChild(icon);
+    const txt = document.createElement("span");
+    txt.textContent = "Refused";
+    label.appendChild(txt);
+  } else {
+    label.textContent = "Assistant";
+  }
+  const body = document.createElement("div");
+  body.textContent = entry.body || "";
+  bubble.appendChild(label);
+  bubble.appendChild(body);
+  _renderAttachments(bubble, entry.attachments);
+  wrapper.appendChild(bubble);
+}
+
+function _renderEntryToolCall(wrapper, entry, pairedResult) {
+  wrapper.className = "flex justify-start";
+  const details = document.createElement("details");
+  details.className = "bg-slate-100 border border-slate-300 rounded-lg px-3 py-2 max-w-[70%] text-sm text-slate-700";
+  const summary = document.createElement("summary");
+  summary.className = "cursor-pointer flex items-center gap-1";
+  summary.setAttribute("aria-label",
+    `Tool call: ${entry.tool_name || "unknown"}`);
+  const icon = document.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "⚙";
+  summary.appendChild(icon);
+  const txt = document.createElement("span");
+  txt.textContent = `Called ${entry.tool_name || "tool"}`;
+  summary.appendChild(txt);
+  details.appendChild(summary);
+  const argsLabel = document.createElement("div");
+  argsLabel.className = "mt-2 text-xs uppercase tracking-wide opacity-60";
+  argsLabel.textContent = "Arguments";
+  details.appendChild(argsLabel);
+  const args = document.createElement("pre");
+  args.className = "mt-1 text-xs whitespace-pre-wrap break-words";
+  args.textContent = entry.tool_args
+    ? JSON.stringify(entry.tool_args, null, 2)
+    : (entry.body || "");
+  details.appendChild(args);
+  if (pairedResult) {
+    const resultLabel = document.createElement("div");
+    resultLabel.className = "mt-2 text-xs uppercase tracking-wide opacity-60";
+    resultLabel.textContent = "Result";
+    details.appendChild(resultLabel);
+    const result = document.createElement("div");
+    result.className = "mt-1 text-xs whitespace-pre-wrap break-words";
+    result.textContent = pairedResult.body || "";
+    details.appendChild(result);
+  }
+  wrapper.appendChild(details);
+}
+
+function _renderEntryToolResult(wrapper, entry) {
+  // Reached only for orphan tool_results (no matching tool_call in
+  // this conversation). Render standalone with the orphan label.
+  wrapper.className = "flex justify-start";
+  const bubble = document.createElement("div");
+  bubble.className = "bg-slate-100 border border-slate-300 rounded-lg px-3 py-2 max-w-[70%] text-sm text-slate-700";
+  bubble.setAttribute("aria-label", "Orphan tool result");
+  const label = document.createElement("div");
+  label.className = "text-xs opacity-70 mb-1 flex items-center gap-1";
+  const icon = document.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "⚙";
+  label.appendChild(icon);
+  const txt = document.createElement("span");
+  txt.textContent = `Tool result (${entry.tool_name || "unknown"}, orphan)`;
+  label.appendChild(txt);
+  const body = document.createElement("div");
+  body.textContent = entry.body || "";
+  bubble.appendChild(label);
+  bubble.appendChild(body);
+  wrapper.appendChild(bubble);
+}
+
+function _renderEntrySystemEvent(wrapper, entry) {
+  wrapper.className = "flex justify-center";
+  const notice = document.createElement("div");
+  notice.className = "bg-indigo-50 border-l-4 border-indigo-400 text-indigo-900 px-3 py-2 max-w-[80%] text-sm";
+  notice.setAttribute("role", "status");
+  const labelRow = document.createElement("div");
+  labelRow.className = "text-xs uppercase tracking-wide opacity-70 mb-1 flex items-center gap-1";
+  const icon = document.createElement("span");
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "ℹ";
+  labelRow.appendChild(icon);
+  const labelTxt = document.createElement("span");
+  labelTxt.textContent = entry.source ? entry.source : "System";
+  labelRow.appendChild(labelTxt);
+  const body = document.createElement("div");
+  body.textContent = entry.body || "";
+  notice.appendChild(labelRow);
+  notice.appendChild(body);
+  wrapper.appendChild(notice);
+}
+
+function _renderEntryUnknown(wrapper, entry) {
+  wrapper.className = "flex justify-start";
+  const bubble = document.createElement("div");
+  bubble.className = "bg-gray-100 border border-gray-300 rounded-lg px-3 py-2 max-w-[70%] text-sm text-gray-700";
+  bubble.textContent =
+    `[unknown entry kind: ${entry.kind || "?"}] ${entry.body || ""}`;
+  wrapper.appendChild(bubble);
+}
+
+const CONVERSATION_ENTRY_RENDERERS = {
+  user: _renderEntryUser,
+  assistant: _renderEntryAssistant,
+  tool_call: _renderEntryToolCall,
+  tool_result: _renderEntryToolResult,
+  system_event: _renderEntrySystemEvent,
+};
+
+function _renderAttachments(parent, attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return;
+  const wrap = document.createElement("div");
+  wrap.className = "mt-2 space-y-1";
+  wrap.setAttribute("data-termin-chat-attachments", "");
+  for (const a of attachments) {
+    if (!a || !a.mime_type) continue;
+    const mime = String(a.mime_type);
+    const node = document.createElement("div");
+    node.setAttribute("data-termin-attachment", "");
+    node.setAttribute("data-termin-attachment-mime", mime);
+    if (mime.indexOf("image/") === 0) {
+      const img = document.createElement("img");
+      img.alt = a.file_name || "attachment";
+      img.src = `data:${mime};base64,${a.body || ""}`;
+      img.className = "max-h-48 rounded";
+      node.appendChild(img);
+    } else if (mime === "application/pdf") {
+      const link = document.createElement("a");
+      link.className = "underline text-sm";
+      link.href = `data:${mime};base64,${a.body || ""}`;
+      link.download = a.file_name || "document.pdf";
+      link.textContent = `📎 ${a.file_name || "document.pdf"}`;
+      node.appendChild(link);
+    } else {
+      // text-ish: collapsed expandable
+      const details = document.createElement("details");
+      details.className = "text-xs";
+      const summary = document.createElement("summary");
+      summary.className = "cursor-pointer";
+      summary.textContent = `📎 ${a.file_name || "attachment"} (${mime})`;
+      details.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.className = "mt-1 whitespace-pre-wrap break-words";
+      pre.textContent = a.body || "";
+      details.appendChild(pre);
+      node.appendChild(details);
+    }
+    wrap.appendChild(node);
+  }
+  parent.appendChild(wrap);
 }
 
 function hydrateDataTables() {
