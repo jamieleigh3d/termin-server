@@ -716,7 +716,8 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
     ctx.list_records_for_ws = _list_records_for_ws
 
     # ── Event handlers (needs access to ctx for singular_lookup, expr_eval, etc.) ──
-    async def run_event_handlers(db, content_name: str, trigger: str, record: dict):
+    async def run_event_handlers(db, content_name: str, trigger: str, record: dict,
+                                 *, appended_entry: dict | None = None):
         for ev in ir.get("events", []):
             if ev.get("trigger") == "expr" and ev.get("condition_expr"):
                 if content_name == ev.get("source_content", ""):
@@ -764,15 +765,21 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                         print(f"[Termin] [WARN] Event handler error: {_ev_err}")
 
         # Event-triggered Computes (G6)
+        # v0.9.2 L5: trigger may be either a verb (created/updated/deleted) for
+        # the standard CRUD shape or `<field>.appended` for the field-targeted
+        # append event. The `event_type` candidates below cover both — the
+        # appended shape is `<content>.<field>.appended` (no plural-singular
+        # variation since the field name is the discriminator).
         event_type = f"{content_name.rstrip('s') if content_name.endswith('s') else content_name}.{trigger}"
         singular = ctx.singular_lookup.get(content_name, "")
         event_type_singular = f"{singular}.{trigger}" if singular else event_type
+        event_type_plural = f"{content_name}.{trigger}"
 
         for comp in ctx.trigger_computes:
             trigger_spec = comp.get("trigger", "")
             if trigger_spec.startswith("event "):
                 trigger_event = trigger_spec[len("event "):].strip().strip('"')
-                if trigger_event in (event_type, event_type_singular, f"{content_name}.{trigger}"):
+                if trigger_event in (event_type, event_type_singular, event_type_plural):
                     where_expr = comp.get("trigger_where")
                     if where_expr:
                         wctx = dict(record)
@@ -783,6 +790,11 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                         prefixed["created"] = True
                         prefixed["updated"] = True
                         wctx[snake_sing] = prefixed
+                        # v0.9.2 L5: bind `appended_entry` so trigger predicates
+                        # like `appended_entry.kind == "user"` work without
+                        # double-loading the conversation column.
+                        if appended_entry is not None:
+                            wctx["appended_entry"] = appended_entry
                         try:
                             if not ctx.expr_eval.evaluate(where_expr, wctx):
                                 continue

@@ -141,6 +141,150 @@ As anonymous, I want to chat so that I can verify append:
         assert bad.status_code == 400, bad.text
 
 
+# ── v0.9.2 L5: <content>.<field>.appended event class ──
+
+
+class TestAppendedEvent:
+    """v0.9.2 L5: every successful append fires a
+    `<content>.<field>.appended` event on the EventBus. The event is
+    distinct from the existing `<content>.updated` shape — subscribers
+    can filter by the field-specific channel, and computes can declare
+    `Trigger on event "<content>.<field>.appended"` to react to
+    conversation activity without false positives from any other
+    column update.
+
+    Per tech-design §9, the event payload carries:
+      record_id, record (full record after append), appended_entry,
+      triggered_at, invoked_by_principal_id, trigger_kind.
+
+    Trigger predicates can reference `appended_entry` (e.g.,
+    `appended_entry.kind == "user"`) so listener computes can filter
+    on per-entry kind without double-loading the conversation.
+    """
+
+    _APPEND_SOURCE = '''Application: Append Event Test
+  Description: v0.9.2 L5 fixture
+Id: 6c8f2d1e-3a44-4b1c-9d8e-2f5a3b7c8d92
+
+Identity:
+  Scopes are "chat.use"
+  An "anonymous" has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads.conversation
+
+As anonymous, I want to chat so that I can verify event firing:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def append_client(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._APPEND_SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "append_event.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as client:
+            yield client
+
+    def _ctx_from_client(self, client):
+        """Pull the RuntimeContext off the FastAPI app state so tests
+        can subscribe to its EventBus directly."""
+        ctx = getattr(client.app.state, "ctx", None)
+        if ctx is None:
+            # Older create_termin_app stashes ctx on app itself
+            ctx = getattr(client.app, "_termin_ctx", None)
+        assert ctx is not None and getattr(ctx, "event_bus", None) is not None, (
+            "RuntimeContext.event_bus should be reachable from test client app"
+        )
+        return ctx
+
+    def test_append_publishes_appended_event(self, append_client):
+        """The append handler must publish on the
+        `content.<name>.<field>.appended` channel with the documented
+        payload shape (§9.1)."""
+        import asyncio
+
+        ctx = self._ctx_from_client(append_client)
+        # Subscribe BEFORE the append so the in-memory queue catches the event.
+        queue = ctx.event_bus.subscribe(
+            channel_id="content.chat_threads.conversation.appended")
+
+        create = append_client.post(
+            "/api/v1/chat_threads", json={"title": "event test"})
+        thread_id = create.json()["id"]
+
+        ap = append_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user", "body": "hello world"})
+        assert ap.status_code == 201, ap.text
+        entry = ap.json()
+
+        # The publish happens inside the append handler; by the time
+        # the HTTP response is back the event must already be on the queue.
+        try:
+            event = asyncio.get_event_loop().run_until_complete(
+                asyncio.wait_for(queue.get(), timeout=1.0))
+        except asyncio.TimeoutError:
+            pytest.fail("appended event was not published within 1s")
+
+        assert event["channel_id"] == "content.chat_threads.conversation.appended"
+        assert event["content_name"] == "chat_threads"
+        assert event["field_name"] == "conversation"
+        # record_id comes from the URL path-param (string); the create-route
+        # returns an int. Compare as strings — the wire shape is text either way.
+        assert str(event["record_id"]) == str(thread_id)
+        assert event["trigger_kind"] == "crud-append"
+        assert event["appended_entry"]["id"] == entry["id"]
+        assert event["appended_entry"]["kind"] == "user"
+        assert event["appended_entry"]["body"] == "hello world"
+        assert event.get("triggered_at"), "triggered_at timestamp required"
+        # record carries the full parent post-append; the conversation
+        # column holds the JSON list including the new entry.
+        assert event.get("record"), "full record required in payload"
+
+    def test_appended_event_does_not_fire_on_other_updates(self, append_client):
+        """A regular PUT update on the parent record must not fire the
+        :appended event. The :appended channel is reserved for actual
+        appends — keeping the channel discriminating is the whole point
+        of the new event class."""
+        import asyncio
+
+        ctx = self._ctx_from_client(append_client)
+        queue = ctx.event_bus.subscribe(
+            channel_id="content.chat_threads.conversation.appended")
+
+        create = append_client.post(
+            "/api/v1/chat_threads", json={"title": "before"})
+        thread_id = create.json()["id"]
+
+        # Update the title — should fire `_updated` but not `.conversation.appended`.
+        upd = append_client.put(
+            f"/api/v1/chat_threads/{thread_id}",
+            json={"title": "after"})
+        assert upd.status_code in (200, 201)
+
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.get_event_loop().run_until_complete(
+                asyncio.wait_for(queue.get(), timeout=0.3))
+
+
 # ── Reflection / introspection ──
 
 

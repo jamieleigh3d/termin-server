@@ -567,12 +567,46 @@ def _make_append_route(app, ctx, path, cr, sc, field_name, row_filter=None):
                 entry[k] = payload[k]
 
         entries.append(entry)
-        await update_record(
+        updated_record = await update_record(
             db, _cr, key_val,
             {_fn: json.dumps(entries)},
             terminator=ctx.terminator,
-            event_bus=None,   # L5 will publish the appended event
+            event_bus=None,   # the standard _updated event is suppressed —
+                              # L5 publishes the field-specific .appended event
+                              # below instead, so subscribers get one signal,
+                              # not two.
         )
+
+        # v0.9.2 L5: publish `content.<name>.<field>.appended` so listener
+        # computes (Trigger on event "X.Y.appended" where ...) and any WS
+        # subscribers receive the new entry. Channel is field-specific so
+        # subscribers can react to conversation activity on one field
+        # without false positives from other column updates.
+        if ctx.event_bus is not None:
+            await ctx.event_bus.publish({
+                "type": f"{_cr}_{_fn}_appended",
+                "channel_id": f"content.{_cr}.{_fn}.appended",
+                "content_name": _cr,
+                "field_name": _fn,
+                "record_id": key_val,
+                "record": updated_record,
+                "appended_entry": entry,
+                "triggered_at": entry["created_at"],
+                "invoked_by_principal_id": entry["appended_by_principal_id"],
+                "trigger_kind": "crud-append",
+            })
+
+        # v0.9.2 L5: dispatch listener computes that triggered on this
+        # event. Mirrors the per-CRUD-verb dispatch path used by
+        # create/update/delete — `run_event_handlers` is the existing
+        # entrypoint that walks `ir.events` (When-rules) and
+        # `ir.computes` with `Trigger on event "..."`. The trigger
+        # string for an append is `<content>.<field>.appended`.
+        if hasattr(ctx, "run_event_handlers"):
+            await ctx.run_event_handlers(
+                db, _cr, f"{_fn}.appended", updated_record,
+                appended_entry=entry,
+            )
 
         return entry
 
