@@ -51,6 +51,7 @@ from .transitions import build_transition_feedback, register_transition_routes
 from .routes import (
     register_crud_routes, register_reflection_routes, register_channel_routes,
     register_sse_routes, register_runtime_endpoints,
+    _do_append, AppendValidationError, AppendNotFoundError,
 )
 from .pages import register_page_routes
 from .compute_runner import execute_compute, register_compute_endpoint
@@ -716,8 +717,122 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
     ctx.list_records_for_ws = _list_records_for_ws
 
     # ── Event handlers (needs access to ctx for singular_lookup, expr_eval, etc.) ──
+    async def _execute_when_rule_append(
+        db, ev: dict, action: dict, record: dict,
+        *, evctx: dict, appended_entry: dict | None,
+        invoked_by_principal_id: str | None,
+    ):
+        """v0.9.2 L8 (tech-design §13.2): execute one Append action that
+        appears in a When-rule's body.
+
+        Builds the payload by CEL-evaluating the body expression and
+        any metadata-tail clauses against the same context the predicate
+        used (which already has `appended_entry` bound, plus the parent
+        record fields). Then dispatches through the shared
+        :func:`_do_append` helper so the new entry is identical in
+        shape to one written via the REST or WebSocket surface — same
+        validation, same event publication, same audit hooks.
+
+        The When-rule append inherits the upstream principal that
+        triggered the original append; the audit trail attributes the
+        synthetic entry to the user whose action set off the chain.
+        Row-filter is None — When-rules are server-side and not gated
+        by per-row ownership rules (a server-side actor doesn't
+        impersonate a row owner).
+
+        Loop prevention is structural, not enforced here: the OVERSEER
+        pattern relies on the kind discriminator
+        (`appended_entry.kind == "user"` predicate vs `system_event`
+        injection). The :func:`_do_append` helper publishes another
+        `<content>.<field>.appended` event for the synthetic entry,
+        which re-enters this dispatch loop — but with
+        `appended_entry.kind == "system_event"` the predicate returns
+        False so no re-trigger. See §13.2 ("Action ordering ... the
+        append fires its own ... event ... which doesn't match the
+        kind == 'user' predicate any subscribed agent uses").
+        """
+        # Resolve the upstream principal as the appender. Build a
+        # minimal user dict in the shape _do_append expects (it reads
+        # `id` from a top-level key OR from the_user.id). For events
+        # without a known principal we pass an empty dict so
+        # `appended_by_principal_id` is "" — same shape as the L5
+        # event payload's invoked_by_principal_id field.
+        appender_id = invoked_by_principal_id or ""
+        if not appender_id and appended_entry is not None:
+            appender_id = appended_entry.get("appended_by_principal_id", "") or ""
+        user_dict = {"id": appender_id} if appender_id else {}
+
+        # Evaluate the body expression against the predicate context
+        # (same evctx the When-rule's condition saw — appended_entry
+        # is already bound, and the parent record fields are flat).
+        try:
+            body_value = ctx.expr_eval.evaluate(action["append_body_expr"], evctx)
+        except Exception as _eval_err:
+            print(
+                f"[Termin] [WARN] When-rule Append body eval failed: "
+                f"{_eval_err}"
+            )
+            return
+        # CEL string concatenation produces a Python str; coerce other
+        # types so the JSON storage layer accepts them.
+        if not isinstance(body_value, str):
+            body_value = str(body_value)
+        payload = {
+            "kind": action["append_kind"],
+            "body": body_value,
+        }
+        # Metadata clauses — each is a (key, expr) pair. Evaluate
+        # each via CEL so quoted literals (`source: "OVERSEER"`)
+        # collapse to bare strings and CEL refs (`source: \`upstream.principal\``)
+        # resolve against the predicate context.
+        for k, expr in action.get("append_metadata") or ():
+            try:
+                v = ctx.expr_eval.evaluate(expr, evctx)
+            except Exception as _meta_err:
+                print(
+                    f"[Termin] [WARN] When-rule Append metadata "
+                    f"'{k}' eval failed: {_meta_err}"
+                )
+                continue
+            payload[k] = v
+
+        # The parent record id sits on `record["id"]` — for the
+        # OVERSEER pattern the When-rule writes back to the SAME
+        # parent record whose conversation just got the upstream
+        # entry. The L5 dispatch path already passes this record
+        # in; we just read its id.
+        key_val = record.get("id")
+        if not key_val:
+            print(
+                f"[Termin] [WARN] When-rule Append: parent record "
+                f"missing id; skipping. content={action.get('append_content')!r}, "
+                f"field={action.get('append_field')!r}"
+            )
+            return
+
+        try:
+            await _do_append(
+                ctx,
+                content_ref=action["append_content"],
+                key_val=key_val,
+                field_name=action["append_field"],
+                payload=payload,
+                user=user_dict,
+                row_filter=None,
+            )
+        except (AppendValidationError, AppendNotFoundError) as _err:
+            # When-rule appends fail loud in the log so the author can
+            # diagnose; the upstream HTTP/WS request that triggered
+            # this chain has already returned by now (event dispatch
+            # runs after the response is sent), so there's no surface
+            # to propagate the error back to the user.
+            print(
+                f"[Termin] [WARN] When-rule Append failed: {_err}"
+            )
+
     async def run_event_handlers(db, content_name: str, trigger: str, record: dict,
-                                 *, appended_entry: dict | None = None):
+                                 *, appended_entry: dict | None = None,
+                                 invoked_by_principal_id: str | None = None):
         for ev in ir.get("events", []):
             if ev.get("trigger") == "expr" and ev.get("condition_expr"):
                 if content_name == ev.get("source_content", ""):
@@ -735,29 +850,74 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     prefixed["updated"] = True
                     prefixed["created"] = True
                     evctx[camel_prefix] = prefixed
+                    # v0.9.2 L8 (tech-design §13.1): bind `appended_entry`
+                    # so When-rule predicates like
+                    # `appended_entry.kind == "user" && session.message_count >= 3`
+                    # resolve correctly. Mirrors the compute-trigger path
+                    # added in L5; same binding name, same shape.
+                    if appended_entry is not None:
+                        evctx["appended_entry"] = appended_entry
                     try:
                         if ctx.expr_eval.evaluate(ev["condition_expr"], evctx):
-                            action = ev.get("action")
-                            if action and action.get("column_mapping"):
-                                insert_data = {p[0]: record.get(p[1], "") for p in action["column_mapping"]}
-                                await insert_raw(db, action["target_content"], insert_data)
-                            elif action and action.get("send_channel"):
-                                def _sync_send(_action=action, _record=dict(record), _ev=ev):
-                                    import httpx as _httpx
-                                    ch_name = _action["send_channel"]
-                                    try:
-                                        config = ctx.channel_dispatcher.get_config(ch_name)
-                                        if not config or not config.url:
-                                            print(f"[Termin] Channel '{ch_name}': no deploy config, send skipped")
-                                            return
-                                        headers = ctx.channel_dispatcher._build_headers(config)
-                                        resp = _httpx.post(config.url, json=_record, headers=headers,
-                                                           timeout=config.timeout_ms / 1000.0)
-                                        log = _ev.get("log_level", "INFO")
-                                        print(f"[Termin] [{log}] Event sent {_action.get('send_content', 'record')} to channel '{ch_name}' (HTTP {resp.status_code})")
-                                    except Exception as e:
-                                        print(f"[Termin] [ERROR] Channel send to '{ch_name}' failed: {e}")
-                                threading.Thread(target=_sync_send, daemon=True).start()
+                            # v0.9.2 L8 (tech-design §13.2): When-rule
+                            # bodies may now carry a sequence of actions
+                            # (Create, Send, Append) that execute in
+                            # source order. The new `actions` tuple on
+                            # the IR carries the full sequence; legacy
+                            # single-action bodies (pre-L8) populate it
+                            # with one entry, mirrored from `action`,
+                            # so the loop below covers both shapes.
+                            actions_to_run = list(ev.get("actions") or [])
+                            if not actions_to_run and ev.get("action"):
+                                actions_to_run = [ev["action"]]
+                            for action in actions_to_run:
+                                if action.get("append_field"):
+                                    # Append action — L8. Run via the
+                                    # shared _do_append helper so the
+                                    # behaviour matches the REST/WS
+                                    # surfaces (validation, event
+                                    # publication, audit). The When-rule
+                                    # action inherits the upstream
+                                    # principal so the audit trail is
+                                    # cohesive: a user message arrives
+                                    # → fires the appended event → the
+                                    # When-rule's append shows the same
+                                    # principal as the cause.
+                                    await _execute_when_rule_append(
+                                        db, ev, action, record,
+                                        evctx=evctx,
+                                        appended_entry=appended_entry,
+                                        invoked_by_principal_id=invoked_by_principal_id,
+                                    )
+                                elif action.get("column_mapping"):
+                                    insert_data = {
+                                        p[0]: record.get(p[1], "")
+                                        for p in action["column_mapping"]
+                                    }
+                                    await insert_raw(
+                                        db, action["target_content"], insert_data,
+                                    )
+                                elif action.get("send_channel"):
+                                    def _sync_send(_action=action,
+                                                   _record=dict(record),
+                                                   _ev=ev):
+                                        import httpx as _httpx
+                                        ch_name = _action["send_channel"]
+                                        try:
+                                            config = ctx.channel_dispatcher.get_config(ch_name)
+                                            if not config or not config.url:
+                                                print(f"[Termin] Channel '{ch_name}': no deploy config, send skipped")
+                                                return
+                                            headers = ctx.channel_dispatcher._build_headers(config)
+                                            resp = _httpx.post(
+                                                config.url, json=_record,
+                                                headers=headers,
+                                                timeout=config.timeout_ms / 1000.0)
+                                            log = _ev.get("log_level", "INFO")
+                                            print(f"[Termin] [{log}] Event sent {_action.get('send_content', 'record')} to channel '{ch_name}' (HTTP {resp.status_code})")
+                                        except Exception as e:
+                                            print(f"[Termin] [ERROR] Channel send to '{ch_name}' failed: {e}")
+                                    threading.Thread(target=_sync_send, daemon=True).start()
                             await ctx.event_bus.publish({
                                 "type": f"{ev.get('source_content', '')}_event",
                                 "log_level": ev.get("log_level", "INFO")})

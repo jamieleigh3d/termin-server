@@ -648,10 +648,16 @@ async def _do_append(
     # entrypoint that walks `ir.events` (When-rules) and
     # `ir.computes` with `Trigger on event "..."`. The trigger
     # string for an append is `<content>.<field>.appended`.
+    #
+    # v0.9.2 L8: pass `invoked_by_principal_id` so When-rule Append
+    # actions can attribute their synthetic entries to the upstream
+    # caller (the audit chain stays cohesive — the When-rule's append
+    # shows the same principal as the user message that triggered it).
     if hasattr(ctx, "run_event_handlers"):
         await ctx.run_event_handlers(
             db, content_ref, f"{field_name}.appended", updated_record,
             appended_entry=entry,
+            invoked_by_principal_id=entry.get("appended_by_principal_id"),
         )
 
     return entry

@@ -657,10 +657,6 @@ class TestRefusalAppendedToConversation:
         from termin.lower import lower
         from termin_core.ir.serialize import serialize_ir
 
-        # Compile a minimal ai-agent app with `Conversation is`.
-        # Note: the agent's actual provider is replaced with a stub
-        # below — this source just gets us the IR shape with
-        # conversation_source populated.
         source = '''Application: Refusal Conv Test
   Description: v0.9.2 L7.4 fixture
 Id: 5d7c1b2e-8f4a-4b1c-9d8e-2f5a3b7c8d93
@@ -700,7 +696,6 @@ As anonymous, I want to chat so that I can see refusals:
         db_path = str(tmp_path / "refusal_conv.db")
         app = create_termin_app(ir_json, db_path=db_path)
 
-        # Swap the agent provider for a stub that always refuses.
         class _StubLegacy:
             async def agent_loop(self, system, user, tools, execute_tool):
                 await execute_tool("system_refuse", {"reason": "unsupported request"})
@@ -720,8 +715,6 @@ As anonymous, I want to chat so that I can see refusals:
             assert ctx is not None
             ctx.compute_providers = {"reply": _StubProvider()}
 
-            # Create the parent record + append a user message —
-            # which fires the trigger and runs the agent.
             create = client.post(
                 "/api/v1/chat_threads", json={"title": "refusal test"})
             assert create.status_code in (200, 201), create.text
@@ -732,13 +725,9 @@ As anonymous, I want to chat so that I can see refusals:
                 json={"kind": "user", "body": "do something"})
             assert ap.status_code == 201, ap.text
 
-            # The agent runs in a background thread per the dispatch
-            # path. Give it a moment to complete.
             import time
             time.sleep(0.5)
 
-            # Read the conversation back. The user entry should be
-            # there + the refusal entry from the agent.
             get = client.get(f"/api/v1/chat_threads/{thread_id}")
             assert get.status_code == 200
             raw = get.json().get("conversation")
@@ -752,9 +741,154 @@ As anonymous, I want to chat so that I can see refusals:
             assert entries[1]["kind"] == "assistant"
             assert entries[1].get("type") == "refusal"
             assert entries[1]["body"] == "unsupported request"
-            # parent_id traces back to the user message that triggered
-            # the agent's turn.
             assert entries[1].get("parent_id") == entries[0]["id"]
+
+
+# ── v0.9.2 L8: When-rules with Append actions on appended events ──
+
+
+class TestWhenRuleAppendsOnAppendedEvent:
+    """v0.9.2 L8 (tech-design §13): a `When` event-rule subscribes to
+    `<content>.<field>.appended` events through `appended_entry` in its
+    predicate, and uses the Append verb in its action list to inject a
+    synthetic entry. The OVERSEER pattern: a user message arrives →
+    fires the `appended` event → the When-rule's predicate
+    (`appended_entry.kind == "user"`) matches → the When-rule's Append
+    action writes a `system_event` entry into the same conversation
+    column, attributed to the upstream principal.
+
+    The kind discriminator prevents loops: the synthetic
+    ``system_event`` entry fires its own `.appended` event but the
+    user-kind predicate doesn't match, so no re-trigger. There is no
+    built-in cycle detection — the loop guard is structural.
+    """
+
+    _SOURCE = '''Application: When Rule Append L8 Test
+  Description: v0.9.2 L8 fixture — OVERSEER pattern smoke
+Id: 7e1b3a2c-4f9d-4e1a-b3c5-1d2e8f4a9c20
+
+Identity:
+  Scopes are "chat.use"
+  An "anonymous" has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads.conversation
+
+When `appended_entry.kind == "user"`:
+  Append to chat_threads.conversation as "system_event" with body `"echo: " + appended_entry.body`, source: "OVERSEER"
+
+As anonymous, I want to chat so that I can verify When-rule appends:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def client(self, tmp_path):
+        """Compile the inline source on the fly and boot a TestClient.
+        Mirrors the L3/L4/L5 inline-compile-then-boot pattern."""
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "when_rule_append.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as c:
+            yield c
+
+    def _read_entries(self, client, thread_id):
+        """Pull the conversation column out of the parent record and
+        decode to a Python list. Mirrors the L3 round-trip helper."""
+        import json as _json
+        get = client.get(f"/api/v1/chat_threads/{thread_id}")
+        assert get.status_code == 200, get.text
+        raw = get.json().get("conversation")
+        return _json.loads(raw) if isinstance(raw, str) else (raw or [])
+
+    def test_when_rule_fires_on_appended_event(self, client):
+        """A user-kind append on the parent thread fires the
+        `<content>.<field>.appended` event → matches the When-rule's
+        predicate → executes the Append action → second `system_event`
+        entry lands in the same column. End state: two entries in
+        source order, the first the user message, the second the
+        OVERSEER echo."""
+        create = client.post(
+            "/api/v1/chat_threads", json={"title": "L8 fires test"})
+        assert create.status_code in (200, 201), create.text
+        thread_id = create.json()["id"]
+
+        ap = client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user", "body": "ping"})
+        assert ap.status_code == 201, ap.text
+
+        entries = self._read_entries(client, thread_id)
+        assert len(entries) == 2, (
+            f"expected user + system_event entries, got {len(entries)}: {entries}"
+        )
+        assert entries[0]["kind"] == "user"
+        assert entries[0]["body"] == "ping"
+        assert entries[1]["kind"] == "system_event"
+        assert entries[1]["body"] == "echo: ping"
+        assert entries[1].get("source") == "OVERSEER"
+        assert entries[0]["id"] != entries[1]["id"]
+
+    def test_when_rule_predicate_filters(self, client):
+        """The predicate `appended_entry.kind == "user"` only fires on
+        user-kind appends. An assistant-kind append should NOT trigger
+        the When-rule, leaving the conversation with just one entry."""
+        create = client.post(
+            "/api/v1/chat_threads", json={"title": "L8 predicate filter"})
+        thread_id = create.json()["id"]
+
+        ap = client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "assistant", "body": "I am not a user"})
+        assert ap.status_code == 201, ap.text
+
+        entries = self._read_entries(client, thread_id)
+        assert len(entries) == 1, (
+            f"assistant-kind append should not fire When-rule; got "
+            f"{len(entries)} entries: {entries}"
+        )
+        assert entries[0]["kind"] == "assistant"
+        assert entries[0]["body"] == "I am not a user"
+
+    def test_when_rule_does_not_loop(self, client):
+        """The synthetic `system_event` entry the When-rule writes does
+        fire its own `<content>.<field>.appended` event, but the
+        predicate (`kind == "user"`) doesn't match `system_event`, so
+        no re-trigger happens. End state: exactly two entries (the
+        original user + one synthetic), not three or more."""
+        create = client.post(
+            "/api/v1/chat_threads", json={"title": "L8 loop guard"})
+        thread_id = create.json()["id"]
+
+        ap = client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={"kind": "user", "body": "hello"})
+        assert ap.status_code == 201, ap.text
+
+        entries = self._read_entries(client, thread_id)
+        assert len(entries) == 2, (
+            f"loop guard relies on kind discrimination; expected 2 "
+            f"entries, got {len(entries)}: {entries}"
+        )
+        kinds = [e["kind"] for e in entries]
+        assert kinds == ["user", "system_event"], kinds
 
 
 # ── Reflection / introspection ──
