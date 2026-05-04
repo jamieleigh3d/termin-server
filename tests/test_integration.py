@@ -285,6 +285,347 @@ As anonymous, I want to chat so that I can verify event firing:
                 asyncio.wait_for(queue.get(), timeout=0.3))
 
 
+
+
+# ── v0.9.2 L4: APPEND frame over WebSocket ──
+
+
+class TestAppendVerbWebSocket:
+    """v0.9.2 L4: WebSocket parity for the REST :append endpoint.
+
+    Per §8.3 of the v0.9.2 conversation field type tech design:
+    inbound frames of shape ``{"type": "append", "resource": ...,
+    "id": ..., "field": ..., "payload": {...}}`` are dispatched
+    through the same shared ``_do_append`` helper the REST endpoint
+    uses. The same scope gate, the same row_filter check, the same
+    canonical entry shape — same code, two transports.
+
+    Server response: there is NO separate "append response" frame.
+    The append fires the standard ``<content>.<field>.appended``
+    event (L5's job) which propagates to subscribers — including the
+    originating client — via the existing record-subscription
+    channel. On failure: a structured error frame on the
+    ``runtime.append`` topic.
+
+    L5 (event firing) is being implemented in parallel; the
+    round-trip test below verifies storage-side write parity (re-read
+    via REST). Once L5 lands, the same handler will deliver the
+    entry over the originator's existing subscription with no further
+    work in this slice.
+    """
+
+    _WS_APPEND_SOURCE = '''Application: WS Append Test
+  Description: v0.9.2 L4 fixture
+Id: 7e1b3a2c-4f9d-4e1a-b3c5-1d2e8f4a9c02
+
+Identity:
+  Scopes are "chat.use"
+  An "anonymous" has "chat.use"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.use" can view chat_threads
+  Anyone with "chat.use" can create chat_threads
+  Anyone with "chat.use" can append to chat_threads.conversation
+
+As anonymous, I want to chat so that I can verify ws append:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def ws_append_client(self, tmp_path):
+        """Same compile-and-boot pattern as TestAppendVerb. Reuses the
+        REST surface for setup (creating a parent record) and exercises
+        the WS surface for the append itself."""
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._WS_APPEND_SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "ws_append.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as client:
+            yield client
+
+    def _drain_identity(self, ws):
+        """Consume the identity push frame the dispatcher sends right
+        after accept (per ``channel_dispatch._identity_frame``)."""
+        first = ws.receive_json()
+        assert first.get("ch") == "runtime.identity", first
+
+    def _flush_append(self, ws):
+        """Synchronization barrier: send a no-op subscribe frame and
+        await its response. Append frames are dispatched serially in
+        the interceptor's ``receive_json`` loop, so by the time the
+        server responds to a follow-up frame any prior append has
+        committed. Without this barrier, the TestClient WS context
+        manager can close the connection mid-await and lose the
+        in-flight append."""
+        ws.send_json({
+            "v": 1, "ch": "runtime.flush", "op": "subscribe",
+            "ref": "flush",
+        })
+        ack = ws.receive_json()
+        assert ack.get("op") == "response", ack
+
+    def test_ws_append_frame_round_trip(self, ws_append_client):
+        """Send an append frame over WS; verify the entry lands in
+        storage and is readable via the REST GET endpoint.
+
+        L5 (event firing on append) will deliver the new entry to the
+        originator over its existing subscription. Until L5 lands, we
+        verify storage-side write parity by re-reading via REST. The
+        WS handler itself is stable and contractually equivalent to
+        the REST handler for the storage side; the event delivery is
+        a separate seam L5 will wire."""
+        # Create a parent record via the REST surface — the WS handler
+        # operates on existing records, doesn't create them.
+        create = ws_append_client.post(
+            "/api/v1/chat_threads", json={"title": "ws round trip"})
+        assert create.status_code in (200, 201), create.text
+        thread_id = create.json()["id"]
+
+        with ws_append_client.websocket_connect("/runtime/ws") as ws:
+            self._drain_identity(ws)
+            ws.send_json({
+                "type": "append",
+                "resource": "chat_threads",
+                "id": thread_id,
+                "field": "conversation",
+                "payload": {"kind": "user", "body": "hello over ws"},
+            })
+            # No separate response frame per §8.3 — but the test
+            # client closes the connection eagerly, so synchronize on
+            # a follow-up frame to guarantee the append has committed
+            # before the context exits.
+            self._flush_append(ws)
+
+        # Re-read the parent record. The conversation column now
+        # carries one entry with the WS-supplied body.
+        import json as _json
+        get = ws_append_client.get(f"/api/v1/chat_threads/{thread_id}")
+        assert get.status_code == 200, get.text
+        record = get.json()
+        raw = record.get("conversation")
+        entries = _json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(entries, list), f"expected list, got {raw!r}"
+        assert len(entries) == 1, entries
+        assert entries[0]["kind"] == "user"
+        assert entries[0]["body"] == "hello over ws"
+        # Canonical runtime-set fields must be present — same shape as
+        # the REST handler produces.
+        assert entries[0].get("id"), "WS-appended entry missing id"
+        assert entries[0].get("created_at"), (
+            "WS-appended entry missing created_at"
+        )
+
+    def test_ws_append_rejects_invalid_kind(self, ws_append_client):
+        """An invalid kind on an append frame surfaces as a structured
+        error frame on the ``runtime.append`` channel; nothing is
+        written to storage."""
+        create = ws_append_client.post(
+            "/api/v1/chat_threads", json={"title": "ws invalid kind"})
+        thread_id = create.json()["id"]
+
+        with ws_append_client.websocket_connect("/runtime/ws") as ws:
+            self._drain_identity(ws)
+            ws.send_json({
+                "type": "append",
+                "resource": "chat_threads",
+                "id": thread_id,
+                "field": "conversation",
+                "payload": {"kind": "bogus", "body": "should fail"},
+            })
+            err = ws.receive_json()
+
+        assert err.get("op") == "error", err
+        assert err.get("ch") == "runtime.append", err
+        assert err.get("payload", {}).get("code") == "validation_error", err
+
+        # Storage must be empty — error path should not commit.
+        import json as _json
+        get = ws_append_client.get(f"/api/v1/chat_threads/{thread_id}")
+        raw = get.json().get("conversation")
+        entries = (
+            _json.loads(raw)
+            if isinstance(raw, str) and raw else (raw or [])
+        )
+        assert entries == [], (
+            f"validation error left a partial write: {entries!r}"
+        )
+
+    def test_ws_append_rejects_unauthorized(self, tmp_path):
+        """A connection whose principal lacks the required scope must
+        not be able to append. The frame surfaces an error frame with
+        ``code == "forbidden"``; nothing is written.
+
+        The fixture for this test uses a stricter scope than the
+        anonymous role gets, so the same WS connection that would
+        normally succeed gets rejected on the scope gate."""
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        # Anonymous holds only `chat.read`; appending requires
+        # `chat.write`, which anonymous does not have.
+        source = '''Application: WS Append Auth Test
+  Description: v0.9.2 L4 unauthorized fixture
+Id: 7e1b3a2c-4f9d-4e1a-b3c5-1d2e8f4a9c03
+
+Identity:
+  Scopes are "chat.read", "chat.write"
+  An "anonymous" has "chat.read"
+
+Content called "chat_threads":
+  Each chat_thread has a title which is text, default "Conversation"
+  Each chat_thread has a conversation which is conversation
+  Anyone with "chat.read" can view chat_threads
+  Anyone with "chat.read" can create chat_threads
+  Anyone with "chat.write" can append to chat_threads.conversation
+
+As anonymous, I want to chat so that I can verify auth gate:
+  Show a page called "Chat"
+'''
+        program, perr = parse_peg(source)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "ws_auth.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as client:
+            # Create the parent record via REST first (anonymous can
+            # `create chat_threads`).
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "ws auth test"})
+            assert create.status_code in (200, 201), create.text
+            thread_id = create.json()["id"]
+
+            with client.websocket_connect("/runtime/ws") as ws:
+                self._drain_identity(ws)
+                ws.send_json({
+                    "type": "append",
+                    "resource": "chat_threads",
+                    "id": thread_id,
+                    "field": "conversation",
+                    "payload": {"kind": "user", "body": "denied"},
+                })
+                err = ws.receive_json()
+
+            assert err.get("op") == "error", err
+            assert err.get("payload", {}).get("code") == "forbidden", err
+
+            # Nothing written.
+            import json as _json
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = (
+                _json.loads(raw)
+                if isinstance(raw, str) and raw else (raw or [])
+            )
+            assert entries == [], (
+                f"forbidden append left a partial write: {entries!r}"
+            )
+
+    def test_ws_and_rest_share_one_handler(self, ws_append_client):
+        """End-to-end parity check: append once via WS, once via REST,
+        verify both produce the same canonical entry shape (same set
+        of keys, same kind/body fidelity) and that the parent record's
+        conversation column ends with both entries in source order.
+
+        This is the test that catches handler-drift — the failure mode
+        the L4 refactor exists to prevent. If the WS path ever forks
+        from the shared ``_do_append`` helper, the per-entry shape
+        assertion below diverges first."""
+        create = ws_append_client.post(
+            "/api/v1/chat_threads", json={"title": "parity check"})
+        thread_id = create.json()["id"]
+
+        # WS append first.
+        with ws_append_client.websocket_connect("/runtime/ws") as ws:
+            self._drain_identity(ws)
+            ws.send_json({
+                "type": "append",
+                "resource": "chat_threads",
+                "id": thread_id,
+                "field": "conversation",
+                "payload": {
+                    "kind": "user",
+                    "body": "via ws",
+                    "source": "ws-test",
+                },
+            })
+            self._flush_append(ws)
+
+        # Then REST append on the same record.
+        rest = ws_append_client.post(
+            f"/api/v1/chat_threads/{thread_id}/conversation:append",
+            json={
+                "kind": "user",
+                "body": "via rest",
+                "source": "rest-test",
+            },
+        )
+        assert rest.status_code == 201, rest.text
+        rest_entry = rest.json()
+
+        # Re-read the record; verify both entries are present in
+        # source order.
+        import json as _json
+        get = ws_append_client.get(f"/api/v1/chat_threads/{thread_id}")
+        raw = get.json().get("conversation")
+        entries = _json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(entries, list)
+        assert len(entries) == 2, (
+            f"expected 2 entries (ws + rest), got {len(entries)}: {entries}"
+        )
+        assert entries[0]["body"] == "via ws"
+        assert entries[1]["body"] == "via rest"
+
+        # Same key surface from both transports — neither carries a
+        # field the other lacks (drift smoke check).
+        ws_entry = entries[0]
+        # Pre-comparison: REST entry currently has the same shape we
+        # built in _do_append; the WS entry must too. The set of
+        # canonical-field keys must be identical between the two
+        # transports — drift in the helper would surface as a missing
+        # key in one but not the other.
+        canonical_keys = {
+            "id", "kind", "body", "created_at", "appended_by_principal_id",
+            "source",
+        }
+        assert canonical_keys.issubset(set(ws_entry.keys())), (
+            f"WS entry missing canonical keys: "
+            f"{canonical_keys - set(ws_entry.keys())} (got {ws_entry})"
+        )
+        assert canonical_keys.issubset(set(rest_entry.keys())), (
+            f"REST entry missing canonical keys: "
+            f"{canonical_keys - set(rest_entry.keys())} (got {rest_entry})"
+        )
+        # Same source-prefix shape, distinct ids — confirms each
+        # transport produced its own UUIDv7.
+        assert ws_entry["id"] != rest_entry["id"]
+        assert ws_entry["source"] == "ws-test"
+        assert rest_entry["source"] == "rest-test"
+
+
 # ── Reflection / introspection ──
 
 
