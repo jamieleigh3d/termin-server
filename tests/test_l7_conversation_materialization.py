@@ -375,7 +375,8 @@ class _TextOnlyStubLegacy:
 
     async def agent_loop_with_conversation(
         self, directive, messages, tools, execute_tool,
-        on_writeback, on_event=None, max_turns=20,
+        on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
     ):
         self.last_directive = directive
         self.last_messages = messages
@@ -395,7 +396,8 @@ class _ToolUsingStubLegacy:
 
     async def agent_loop_with_conversation(
         self, directive, messages, tools, execute_tool,
-        on_writeback, on_event=None, max_turns=20,
+        on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
     ):
         self.last_messages = messages
         # Turn 1: write a tool_call entry, execute the tool, write a
@@ -561,6 +563,164 @@ class TestConversationToolCallWriteback:
         assert tr["tool_call_id"] == "toolu_stub_1"
 
 
+class TestStreamingTextDeltas:
+    """v0.9.2 close-out streaming path: agent_loop_with_conversation
+    accepts on_text_delta + on_text_end callbacks. The runtime wires
+    them to publish on `content.<source>.<field>.streaming` so the
+    chat UI renders token-by-token without waiting for the turn to
+    commit. Tested via stubs that drive the callback directly — the
+    real Anthropic streaming surface is exercised by JL's manual
+    end-to-end test (no live API in CI)."""
+
+    def test_text_delta_callback_publishes_on_streaming_channel(
+            self, tmp_path):
+        """Stub legacy fires on_text_delta(delta) twice + on_text_end
+        (committed=True) + on_writeback final. The runtime must
+        publish per-delta + end events on the streaming channel."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        captured_events = []
+
+        class _StreamingStub:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                on_event=None, max_turns=20,
+            ):
+                if on_text_delta:
+                    await on_text_delta("Hello ")
+                    await on_text_delta("there")
+                # Commit the final text via on_writeback (this is
+                # what the production loop does) and fire end with
+                # committed=True so the chat UI knows the matching
+                # appended event will follow.
+                await on_writeback(kind="assistant", body="Hello there")
+                if on_text_end:
+                    await on_text_end(committed=True)
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_StreamingStub())}
+
+            # Tap the event bus — every published event lands here.
+            original_publish = ctx.event_bus.publish
+            async def _capture_publish(event):
+                captured_events.append(event)
+                await original_publish(event)
+            ctx.event_bus.publish = _capture_publish
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "stream"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "hi"})
+            time.sleep(0.5)
+
+        # The streaming channel saw two delta events + one end.
+        stream_channel = (
+            "content.chat_threads.conversation.streaming"
+        )
+        stream_events = [
+            e for e in captured_events
+            if e.get("channel_id") == stream_channel
+        ]
+        deltas = [e for e in stream_events if e.get("type") == "delta"]
+        ends = [e for e in stream_events if e.get("type") == "end"]
+        assert len(deltas) == 2, (
+            f"expected 2 delta events on streaming channel; "
+            f"got {len(deltas)}: {deltas!r}"
+        )
+        assert deltas[0]["text"] == "Hello "
+        assert deltas[1]["text"] == "there"
+        assert len(ends) == 1, ends
+        assert ends[0]["committed"] is True
+        # Each event has the record_id so the chat UI can filter
+        # for the active thread.
+        for e in stream_events:
+            assert e.get("record_id") == thread_id
+
+    def test_tool_call_turn_emits_text_end_committed_false(self, tmp_path):
+        """When the agent's turn ends with tool calls (no final
+        assistant text committed), the runtime fires
+        on_text_end(committed=False) so the chat UI clears the
+        pending bubble. The mid-turn streamed text was 'thinking',
+        not a commit-bound reply."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path, with_tool=True)
+
+        captured_events = []
+
+        class _ThinkingStub:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                on_event=None, max_turns=20,
+            ):
+                # Turn 1: stream thinking text, then call a tool.
+                if on_text_delta:
+                    await on_text_delta("Let me check ")
+                    await on_text_delta("the time...")
+                await on_writeback(
+                    kind="tool_call",
+                    body="current_time({})",
+                    tool_call_id="tc_1",
+                    tool_name="current_time",
+                    tool_args={},
+                )
+                await execute_tool("current_time", {})
+                await on_writeback(
+                    kind="tool_result", body="1pm",
+                    tool_call_id="tc_1",
+                )
+                # Turn 1 ended with tool calls — clear pending bubble.
+                if on_text_end:
+                    await on_text_end(committed=False)
+                # Turn 2: final reply.
+                if on_text_delta:
+                    await on_text_delta("It's 1pm.")
+                await on_writeback(kind="assistant", body="It's 1pm.")
+                if on_text_end:
+                    await on_text_end(committed=True)
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {"reply": _StubProvider(_ThinkingStub())}
+
+            original_publish = ctx.event_bus.publish
+            async def _capture_publish(event):
+                captured_events.append(event)
+                await original_publish(event)
+            ctx.event_bus.publish = _capture_publish
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "thinking"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "what time?"})
+            time.sleep(0.7)
+
+        stream_channel = (
+            "content.chat_threads.conversation.streaming"
+        )
+        ends = [
+            e for e in captured_events
+            if e.get("channel_id") == stream_channel
+            and e.get("type") == "end"
+        ]
+        assert len(ends) == 2, ends
+        assert ends[0]["committed"] is False  # tool turn
+        assert ends[1]["committed"] is True   # final turn
+
+
 class TestRefusalRegressionUnderL71:
     """L7.4's refusal-append path must keep working under L7.1's new
     dispatch — refusal still wins over normal write-back when
@@ -573,7 +733,8 @@ class TestRefusalRegressionUnderL71:
         class _RefuseLegacy:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
-                on_writeback, on_event=None, max_turns=20,
+                on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
             ):
                 # Refuse via the runtime-gated tool; do NOT call
                 # on_writeback for normal text — refusal path owns the
@@ -662,7 +823,8 @@ class TestAgentChatbotV092EndToEnd:
 
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
-                on_writeback, on_event=None, max_turns=20,
+                on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
             ):
                 self.calls.append({"messages": messages})
                 # Pull the most recent user-role text block.
@@ -745,7 +907,8 @@ class TestAgentChatbotV092EndToEnd:
         class _RefuseLegacy:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
-                on_writeback, on_event=None, max_turns=20,
+                on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
             ):
                 await execute_tool(
                     "system_refuse",
@@ -827,7 +990,8 @@ class TestPurposeFieldOnToolCallEntry:
         class _PurposefulLegacy:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
-                on_writeback, on_event=None, max_turns=20,
+                on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
             ):
                 await on_writeback(
                     kind="tool_call",
@@ -1033,7 +1197,8 @@ As an anonymous, I want to chat:
         class _InvokesStubLegacy:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
-                on_writeback, on_event=None, max_turns=20,
+                on_writeback, on_text_delta=None, on_text_end=None,
+        on_event=None, max_turns=20,
             ):
                 # Verify current_time is in the tool surface.
                 captured_tools["names"] = [t["name"] for t in tools]

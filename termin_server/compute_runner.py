@@ -1005,9 +1005,57 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 raise AIProviderError(
                     f"conversation materialization failed: {e}"
                 ) from e
+
+            # v0.9.2 streaming (post-close-out): wire on_text_delta /
+            # on_text_end to a per-record streaming channel so the
+            # chat UI can render token-by-token. The channel name
+            # mirrors the existing `<X>.<Y>.appended` shape:
+            # `content.<source>.<field>.streaming`. Each delta event
+            # carries record_id + text; the `end` event carries
+            # record_id + committed (true if a matching `appended`
+            # event will follow with the persisted entry, false if
+            # the streamed text was tool-call thinking and should
+            # be cleared from the chat UI's pending bubble).
+            conv_content, conv_field = conversation_source
+            stream_channel = (
+                f"content.{conv_content}.{conv_field}.streaming"
+            )
+
+            async def _on_text_delta(text: str):
+                if ctx.event_bus is None:
+                    return
+                envelope = {
+                    "channel_id": stream_channel,
+                    "type": "delta",
+                    "content_name": conv_content,
+                    "field_name": conv_field,
+                    "record_id": record.get("id") if record else None,
+                    "text": text,
+                    "invocation_id": _agent_invocation_id,
+                }
+                envelope["data"] = dict(envelope)
+                await ctx.event_bus.publish(envelope)
+
+            async def _on_text_end(committed: bool):
+                if ctx.event_bus is None:
+                    return
+                envelope = {
+                    "channel_id": stream_channel,
+                    "type": "end",
+                    "content_name": conv_content,
+                    "field_name": conv_field,
+                    "record_id": record.get("id") if record else None,
+                    "committed": bool(committed),
+                    "invocation_id": _agent_invocation_id,
+                }
+                envelope["data"] = dict(envelope)
+                await ctx.event_bus.publish(envelope)
+
             result = await legacy.agent_loop_with_conversation(
                 system_msg, messages, all_tools, _execute_tool,
                 on_writeback=_on_writeback,
+                on_text_delta=_on_text_delta,
+                on_text_end=_on_text_end,
             )
         elif ctx.event_bus is not None and hasattr(
                 legacy, "agent_loop_streaming"):

@@ -1178,6 +1178,8 @@ class AIProvider:
         tools: list[dict],
         execute_tool: Any,
         on_writeback: Any,
+        on_text_delta: Any = None,
+        on_text_end: Any = None,
         on_event: Any = None,
         max_turns: int = 20,
     ) -> dict:
@@ -1199,6 +1201,22 @@ class AIProvider:
         tool_args (for tool_call) or tool_call_id / is_error (for
         tool_result) and lets the runtime layer in metadata.
 
+        v0.9.2 streaming (post-close-out):
+          - ``on_text_delta(text: str)`` (optional, async): fires per
+            text token as the agent streams its response. Lets the
+            runtime publish in-flight text on a streaming channel
+            so chat UIs can render token-by-token without waiting
+            for the turn to commit.
+          - ``on_text_end(committed: bool)`` (optional, async): fires
+            once per turn after the stream closes. ``committed=True``
+            means the runtime called ``on_writeback(kind="assistant",
+            ...)`` with the full text — the chat UI's pending bubble
+            should wait for the matching `appended` event to swap
+            for the persisted entry. ``committed=False`` means the
+            turn ended with tool calls (no final assistant text
+            committed yet) — the chat UI should clear any pending
+            bubble; subsequent turns may resume streaming new text.
+
         Returns: ``{"thinking": "...", "summary": "..."}`` for audit /
         legacy-compat consumers.
         """
@@ -1207,7 +1225,8 @@ class AIProvider:
         if self._service == "anthropic":
             return await self._anthropic_agent_loop_with_conversation(
                 system_prompt, messages, tools, execute_tool,
-                on_writeback, on_event, max_turns,
+                on_writeback, on_text_delta, on_text_end,
+                on_event, max_turns,
             )
         # OpenAI conversation-mode is out of v0.9.2 scope; the
         # analyzer-side check (TERMIN-S061 etc) doesn't gate on
@@ -1225,68 +1244,134 @@ class AIProvider:
         tools: list[dict],
         execute_tool,
         on_writeback,
+        on_text_delta,
+        on_text_end,
         on_event,
         max_turns: int,
     ) -> dict:
         """Anthropic implementation of ``agent_loop_with_conversation``.
 
         Per turn:
-          1. Call ``messages.create`` with the running messages list.
-          2. For each tool_use block: emit on_writeback("tool_call",
-             body=f"{name}({json.dumps(args)})", tool_call_id, tool_name,
-             tool_args), execute via ``execute_tool``, emit
-             on_writeback("tool_result", body=result_str,
-             tool_call_id, is_error), append the assistant turn and
-             tool_results to the local messages array.
-          3. For each text block on the final response (no tool calls):
-             emit on_writeback("assistant", body=text) and return.
-
-        ``on_event`` is reserved for future per-token streaming on the
-        conversation path; v0.9.2 ships non-streaming.
+          1. Open ``messages.stream`` with the running messages list.
+             Iterate stream events:
+               - text_delta events fire on_text_delta(delta) so the
+                 runtime can publish in-flight text on the streaming
+                 channel. Accumulate locally for the eventual
+                 commit.
+               - input_json_delta and other tool-use events are
+                 collected by the SDK; final assembled tool_use
+                 blocks are read from get_final_message().
+          2. For each tool_use block in the final message: emit
+             on_writeback("tool_call", body=f"{name}({json.dumps(args)})",
+             tool_call_id, tool_name, tool_args, purpose), execute
+             via ``execute_tool``, emit on_writeback("tool_result",
+             body=result_str, tool_call_id, is_error), append the
+             assistant turn and tool_results to the local messages
+             array. Fire on_text_end(committed=False) — the text the
+             agent streamed during this turn was "thinking", not a
+             commit-bound reply; the chat UI clears any pending
+             bubble.
+          3. For text-only end of turn (no tool calls): emit
+             on_writeback("assistant", body=accumulated_text) and
+             on_text_end(committed=True). The chat UI's pending
+             bubble waits for the matching `appended` event and
+             swaps for the persisted entry.
         """
         import anthropic
         running_messages = list(messages)
 
         for turn in range(max_turns):
+            # Per-turn state. The producer thread iterates the
+            # synchronous Anthropic stream and pushes text_delta
+            # events onto a queue; the async consumer (us) drains
+            # it and dispatches each delta to on_text_delta. After
+            # the producer signals SENTINEL we have the final
+            # assembled message via stream.get_final_message().
+            state = {"final_message": None, "error": None}
+            accumulated_text = ""
+
+            def producer(put):
+                try:
+                    with self._client.messages.stream(
+                        model=self._model or "claude-sonnet-4-6",
+                        max_tokens=4096,
+                        system=system_prompt,
+                        messages=running_messages,
+                        tools=tools,
+                    ) as stream:
+                        for event in stream:
+                            etype = getattr(event, "type", None)
+                            if etype != "content_block_delta":
+                                continue
+                            delta = getattr(event, "delta", None)
+                            if delta is None:
+                                continue
+                            if getattr(delta, "type", None) == "text_delta":
+                                text = getattr(delta, "text", "") or ""
+                                if text:
+                                    put({"type": "text_delta", "text": text})
+                        state["final_message"] = stream.get_final_message()
+                except Exception as exc:
+                    state["error"] = exc
+
             try:
-                response = self._client.messages.create(
-                    model=self._model or "claude-sonnet-4-6",
-                    max_tokens=4096,
-                    system=system_prompt,
-                    messages=running_messages,
-                    tools=tools,
-                )
-            except anthropic.APIError as e:
+                async for item in self._bridge_events_to_queue(producer):
+                    if item.get("type") == "text_delta":
+                        text = item.get("text", "")
+                        accumulated_text += text
+                        if on_text_delta:
+                            await on_text_delta(text)
+            except AIProviderError as e:
                 raise AIProviderError(
-                    f"Anthropic API error on turn {turn}: {e}"
+                    f"Anthropic streaming error on turn {turn}: {e}"
                 )
 
-            text_blocks = [b for b in response.content
-                           if getattr(b, "type", None) == "text"]
-            tool_calls = [b for b in response.content
+            if state["error"] is not None:
+                raise AIProviderError(
+                    f"Anthropic streaming error on turn {turn}: "
+                    f"{state['error']}"
+                ) from state["error"]
+
+            final_msg = state["final_message"]
+            if final_msg is None:
+                raise AIProviderError(
+                    f"Anthropic stream produced no final message on "
+                    f"turn {turn}"
+                )
+
+            tool_calls = [b for b in final_msg.content
                           if getattr(b, "type", None) == "tool_use"]
 
             if not tool_calls:
-                # End-of-turn: write the assistant text (concatenated
-                # if multiple blocks). Empty text yields no entry —
-                # the caller can decide whether that's an error.
-                final_text = "".join(b.text for b in text_blocks).strip()
+                # End-of-turn: commit the streamed text as the
+                # assistant entry. Empty text yields no entry — the
+                # caller can decide whether that's an error.
+                final_text = accumulated_text.strip()
                 if final_text:
                     await on_writeback(
                         kind="assistant", body=final_text,
                     )
+                    if on_text_end:
+                        await on_text_end(committed=True)
+                else:
+                    if on_text_end:
+                        await on_text_end(committed=False)
                 return {
                     "thinking": final_text,
                     "summary": "completed",
                 }
 
-            # Mid-turn: tool calls are present. Write each tool_call,
-            # execute it, write each tool_result, then loop. The
-            # response.content (which may interleave text + tool_use
-            # blocks) goes into the assistant turn so Anthropic sees
-            # its own thinking back on the next call.
+            # Mid-turn: tool calls are present. Tell the chat UI the
+            # streamed text on this turn was "thinking" — clear any
+            # pending bubble before tool entries start arriving.
+            if on_text_end:
+                await on_text_end(committed=False)
+            # Write each tool_call, execute it, write each tool_result,
+            # then loop. The final_msg.content (which may interleave
+            # text + tool_use blocks) goes into the assistant turn so
+            # Anthropic sees its own thinking back on the next call.
             running_messages.append({
-                "role": "assistant", "content": response.content,
+                "role": "assistant", "content": final_msg.content,
             })
             tool_results = []
             for tc in tool_calls:

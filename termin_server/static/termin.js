@@ -633,6 +633,10 @@ function hydrateConversationFieldChat(chat) {
   }
   function loadActiveThread() {
     messagesContainer.innerHTML = "";
+    // Reset the streaming-bubble state — innerHTML removed the
+    // detached node but the JS reference is now stale.
+    pendingBubble = null;
+    pendingBubbleText = "";
     if (recordId == null) {
       _setThreadLabel("New conversation");
       renderChatPlaceholder(messagesContainer,
@@ -679,6 +683,74 @@ function hydrateConversationFieldChat(chat) {
       chat.dataset.terminRecordId = String(recordId);
     }
     loadActiveThread();
+  });
+
+  // v0.9.2 streaming (post-close-out): subscribe to the per-field
+  // streaming channel for in-flight token deltas. Renders into a
+  // transient "pending" assistant bubble; the bubble is replaced
+  // by the persisted entry once the matching .appended event
+  // fires (or cleared if the streamed text was tool-call thinking
+  // and the runtime emits committed=false).
+  const streamChannel = `content.${source}.${field}.streaming`;
+  let pendingBubble = null;
+  let pendingBubbleText = "";
+  function _ensurePendingBubble() {
+    if (pendingBubble && pendingBubble.parentElement === messagesContainer) {
+      return pendingBubble;
+    }
+    const placeholder = messagesContainer.querySelector(
+      "[data-termin-chat-placeholder]");
+    if (placeholder) placeholder.remove();
+    pendingBubble = document.createElement("div");
+    pendingBubble.className = "flex justify-start";
+    pendingBubble.setAttribute("data-termin-chat-pending-bubble", "");
+    const bubble = document.createElement("div");
+    bubble.className =
+      "bg-gray-200 text-gray-800 rounded-lg px-4 py-2 max-w-[70%]";
+    bubble.setAttribute("aria-label", "Assistant message (streaming)");
+    bubble.setAttribute("aria-live", "polite");
+    const label = document.createElement("div");
+    label.className = "text-xs opacity-70 mb-1";
+    label.textContent = "Assistant";
+    const body = document.createElement("div");
+    body.setAttribute("data-termin-chat-pending-body", "");
+    bubble.appendChild(label);
+    bubble.appendChild(body);
+    pendingBubble.appendChild(bubble);
+    messagesContainer.appendChild(pendingBubble);
+    return pendingBubble;
+  }
+  function _clearPendingBubble() {
+    if (pendingBubble && pendingBubble.parentElement === messagesContainer) {
+      pendingBubble.remove();
+    }
+    pendingBubble = null;
+    pendingBubbleText = "";
+  }
+  subscribe(streamChannel, (ch, data) => {
+    if (!data) return;
+    // Filter by record id — only the active thread's stream renders.
+    if (recordId != null && data.record_id != null &&
+        String(data.record_id) !== String(recordId)) {
+      return;
+    }
+    const t = data.type;
+    if (t === "delta") {
+      _ensurePendingBubble();
+      pendingBubbleText += String(data.text || "");
+      const body = pendingBubble.querySelector(
+        "[data-termin-chat-pending-body]");
+      if (body) body.textContent = pendingBubbleText;
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    } else if (t === "end") {
+      // committed=true: a matching `.appended` will follow shortly
+      // and the chat hydrator's append handler will render the
+      // persisted entry. Clear the pending bubble immediately so
+      // the persisted entry takes its place (no flicker — the
+      // texts match by construction). committed=false: clear and
+      // start fresh; subsequent turns may resume streaming.
+      _clearPendingBubble();
+    }
   });
 
   // Subscribe to the field-specific appended event (L5).
