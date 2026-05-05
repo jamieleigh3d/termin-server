@@ -63,23 +63,41 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _close_bg_loop_cleanly(loop) -> None:
-    """v0.9.2 close-out: drain pending tasks before closing a
-    background asyncio loop so aiosqlite worker threads with
-    lingering ``call_soon_threadsafe`` callbacks don't raise
-    "Event loop is closed" tracebacks at idle (the symptom JL hit
-    after ~2h of a live ``termin serve`` session).
+    """v0.9.2 close-out: drain pending tasks AND threadsafe
+    callbacks before closing a background asyncio loop so
+    aiosqlite worker threads don't raise "Event loop is closed"
+    tracebacks at idle (the symptom JL hit during a live
+    ``termin serve`` session, especially on the refusal path
+    which does extra db work — audit write + refusal-append).
 
-    The race: each ``<X>.<Y>.appended`` event spawns a thread with
-    a fresh asyncio loop running ``execute_compute`` to completion.
-    If aiosqlite's worker has any callback already scheduled on
-    the loop when ``run_until_complete`` returns,
-    ``loop.close()`` cuts the worker off mid-callback — the next
-    ``call_soon_threadsafe`` raises.
+    The race: each ``<X>.<Y>.appended`` event spawns a thread
+    with a fresh asyncio loop running ``execute_compute`` to
+    completion. ``aiosqlite.Connection.close()`` puts a stop
+    sentinel on its worker queue and awaits the close result —
+    but DOES NOT join the worker thread. So between
+    ``await db.close()`` returning and the worker thread fully
+    exiting (after delivering its final ``call_soon_threadsafe``
+    result back to the loop), there's a window where
+    ``loop.close()`` would cut the worker off.
 
-    Mitigation: cancel any pending tasks, await them (collecting
-    cancellation exceptions, ignoring them), shut down async
-    generators, then close. Best-effort — never raises; on a
-    closed loop it's a no-op.
+    Mitigation, in order:
+      1. Cancel pending asyncio.Tasks (orphan fire-and-forget
+         coroutines).
+      2. Drive the loop briefly via ``run_until_complete`` on the
+         cancellation gather + ``shutdown_asyncgens``. These
+         incidentally drain pending ``call_soon_threadsafe``
+         callbacks because run_until_complete iterates the loop.
+      3. Explicit ``asyncio.sleep(0.1)`` to give worker threads
+         that haven't yet delivered their final callback ~100ms
+         to do so. 100ms is empirically enough for aiosqlite's
+         per-connection worker to fully exit; cheaper than the
+         alternative (introspecting worker threads to join them
+         directly, which is implementation-specific and
+         brittle).
+      4. Close.
+
+    Best-effort throughout — never raises; on a closed loop it's
+    a no-op.
     """
     import asyncio as _aio
     if loop is None:
@@ -102,6 +120,14 @@ def _close_bg_loop_cleanly(loop) -> None:
                 pass
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        # Drain window for threadsafe callbacks that may still be
+        # arriving from worker threads (aiosqlite). 100ms is
+        # empirically enough for the per-connection worker to
+        # finish delivering its final result.
+        try:
+            loop.run_until_complete(_aio.sleep(0.1))
         except Exception:
             pass
     finally:

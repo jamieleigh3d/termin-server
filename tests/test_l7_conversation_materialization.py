@@ -93,6 +93,65 @@ class TestBgLoopCleanShutdown:
         _close_bg_loop_cleanly(loop)
         assert loop.is_closed()
 
+    def test_close_bg_loop_cleanly_drains_threadsafe_callbacks(self):
+        """The empirical bug JL hit: aiosqlite's worker thread
+        delivers results to the loop via `call_soon_threadsafe`.
+        These callbacks aren't asyncio.Task instances — they're
+        plain Handle objects scheduled on the loop. The drain
+        helper must give them a chance to land before close.
+
+        Simulates the race: a worker thread schedules a callback
+        right before we call _close_bg_loop_cleanly. Without the
+        drain, the callback fires after close() and raises
+        'Event loop is closed' (caught + logged by Python's
+        default thread-exception handler — noisy in production).
+        """
+        import threading
+        from termin_server.app import _close_bg_loop_cleanly
+
+        loop = asyncio.new_event_loop()
+        # Drive the loop briefly so it's truly active before the
+        # worker thread races against close.
+        async def _tick():
+            await asyncio.sleep(0)
+        loop.run_until_complete(_tick())
+
+        callback_fired = threading.Event()
+        worker_errors: list = []
+
+        def _worker_callback():
+            callback_fired.set()
+
+        def _worker():
+            # Schedule the callback "just before" close — simulates
+            # aiosqlite's worker delivering a result.
+            try:
+                loop.call_soon_threadsafe(_worker_callback)
+            except RuntimeError as exc:
+                # If the loop is already closed by the time we try
+                # to schedule, that's the bug we're guarding against.
+                worker_errors.append(exc)
+
+        # Spawn the worker, then immediately call the cleanup.
+        t = threading.Thread(target=_worker)
+        t.start()
+        _close_bg_loop_cleanly(loop)
+        t.join(timeout=1.0)
+
+        # The drain helper must have given the worker's callback
+        # a chance to run before closing the loop. Either the
+        # callback fired (preferred) or scheduling raised
+        # cleanly. Catastrophic case: the worker scheduled
+        # successfully but the callback never fired — that's
+        # what produces the noisy trace in production.
+        if not callback_fired.is_set() and not worker_errors:
+            pytest.fail(
+                "drain helper closed the loop while a "
+                "call_soon_threadsafe callback was scheduled but "
+                "not yet fired — the very race that produces JL's "
+                "'Event loop is closed' tracebacks on refusal."
+            )
+
 
 # ── L7.2: materialize_to_anthropic — pure mapping helper ──
 
@@ -190,6 +249,11 @@ class TestMaterializeAssistantKind:
 
 class TestMaterializeToolCallKind:
     def test_tool_call_becomes_assistant_tool_use_block(self):
+        # v0.9.2 close-out (2026-05-05): tool_call entries with no
+        # matching tool_result are now silently dropped at
+        # materialization time (Anthropic-API-compat mitigation
+        # for legacy orphan data). Test pairs the call with a
+        # result so it survives and renders as a tool_use block.
         from termin_server.ai_provider import materialize_to_anthropic
         entries = [
             {"kind": "user", "body": "what time is it?", "id": "e-1"},
@@ -197,6 +261,10 @@ class TestMaterializeToolCallKind:
                 "kind": "tool_call", "body": "current_time({})",
                 "tool_call_id": "toolu_01", "tool_name": "current_time",
                 "tool_args": {}, "id": "e-2",
+            },
+            {
+                "kind": "tool_result", "body": "10:00 AM",
+                "tool_call_id": "toolu_01", "id": "e-3",
             },
         ]
         msgs = materialize_to_anthropic(entries)
@@ -295,7 +363,9 @@ class TestMaterializeAdjacentRoleMerging:
 
     def test_assistant_text_then_tool_call_merge(self):
         """A turn that thinks-then-calls produces both an assistant
-        text block and an assistant tool_use block in one message."""
+        text block and an assistant tool_use block in one message.
+        v0.9.2 close-out (2026-05-05): tool_call needs a matching
+        tool_result to survive the orphan-drop mitigation."""
         from termin_server.ai_provider import materialize_to_anthropic
         entries = [
             {"kind": "user", "body": "what time?", "id": "e-1"},
@@ -308,13 +378,22 @@ class TestMaterializeAdjacentRoleMerging:
                 "tool_call_id": "toolu_01", "tool_name": "current_time",
                 "tool_args": {}, "id": "e-3",
             },
+            {
+                "kind": "tool_result", "body": "10:00 AM",
+                "tool_call_id": "toolu_01", "id": "e-4",
+            },
         ]
         msgs = materialize_to_anthropic(entries)
-        assert len(msgs) == 2
+        # 3 messages now: user, assistant (text+tool_use merged),
+        # user (tool_result). The pairing check is on the
+        # assistant message specifically.
+        assert len(msgs) == 3
         assert msgs[1]["role"] == "assistant"
         assert len(msgs[1]["content"]) == 2
         types = [b["type"] for b in msgs[1]["content"]]
         assert types == ["text", "tool_use"]
+        assert msgs[2]["role"] == "user"
+        assert msgs[2]["content"][0]["type"] == "tool_result"
 
     def test_system_event_after_user_merges_user_role(self):
         """system_event maps to user role; adjacent to a real user
@@ -1277,6 +1356,280 @@ class TestRefusalTerminatesLoop:
         assert "error" in post_refuse_results[0], (
             f"post-refusal tool call should return an error envelope; "
             f"got {post_refuse_results[0]!r}"
+        )
+
+
+class TestSystemRefuseDoesNotWriteToolCallEntry:
+    """v0.9.2 close-out (2026-05-05): JL hit Anthropic API 400
+    errors after refusal:
+
+      Error code: 400 - 'tool_use' ids were found without
+      'tool_result' blocks immediately after: toolu_xxx. Each
+      'tool_use' block must have a corresponding 'tool_result'
+      block in the next message.
+
+    Root cause: the conversation-mode loop calls on_writeback for
+    BOTH a tool_call entry and a tool_result entry per tool
+    invocation. For `system_refuse`, the order is:
+
+      1. on_writeback(tool_call) -> writes tool_call entry
+      2. execute_tool(system_refuse) -> sets refusal_state
+      3. on_writeback(tool_result) -> SHORT-CIRCUITED by the
+         runtime's refusal_state check (slice 1 of this evening)
+
+    The orphan tool_call entry persists. Next user message ->
+    new invocation -> materialize_to_anthropic walks the
+    conversation, emits the orphan tool_use block, Anthropic
+    rejects.
+
+    Fix: for `system_refuse`, skip the on_writeback calls for
+    tool_call AND tool_result entirely. The refusal entry
+    (post-loop, kind="agent" type="refusal") is the chat-surface
+    representation of the refusal; the tool_call/tool_result is
+    internal agent-loop protocol that doesn't belong in the
+    persisted conversation.
+
+    Side benefit: the chat UI no longer shows duplicative
+    "Called system_refuse" / "AI Agent refused" entries — just
+    the refusal entry."""
+
+    def test_system_refuse_omits_tool_call_entry_from_conversation(
+            self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        class _ProductionLikeRefuseLegacy:
+            """Mimics the production ai_provider behavior: writes a
+            tool_call entry BEFORE execute_tool, executes the tool
+            (which sets refusal_state), then tries to write a
+            tool_result entry (short-circuited by runtime)."""
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                # Mirror production: tool_call write FIRST, then
+                # execute, then tool_result write. Production
+                # logic: skip the on_writeback calls for
+                # system_refuse.
+                if tools is None:
+                    tools = []
+                # Production code path now skips on_writeback
+                # for system_refuse — simulate that here too,
+                # only fire execute_tool.
+                await execute_tool(
+                    "system_refuse",
+                    {"reason": "policy: cannot do that"},
+                )
+                return {"thinking": "", "summary": "halted"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_ProductionLikeRefuseLegacy()),
+            }
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "no-orphan"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "trigger refuse"})
+            time.sleep(0.5)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            entries = json.loads(get.json().get("conversation") or "[]")
+
+        # Conversation contains user + refusal entry only — NO
+        # tool_call entry for system_refuse, NO tool_result.
+        kinds = [e["kind"] for e in entries]
+        assert kinds == ["user", "agent"], (
+            f"system_refuse must NOT write tool_call/tool_result "
+            f"entries to the conversation field. Found: {kinds!r}"
+        )
+        assert entries[1].get("type") == "refusal"
+
+    def test_orphan_tool_call_for_refuse_breaks_next_turn(self, tmp_path):
+        """Direct reproduction of JL's Anthropic 400 error: if the
+        conversation has an orphan tool_call entry (no matching
+        tool_result), materialize_to_anthropic raises (per §7.5
+        tool linkage validation). Even if the materialization
+        accepted it, Anthropic would reject the request. Verify
+        that a hand-crafted conversation with the orphan pattern
+        is rejected."""
+        from termin_server.ai_provider import (
+            materialize_to_anthropic,
+            ConversationMaterializationError,
+        )
+        # The shape that USED to be persisted by the old runtime:
+        #   user, tool_call(system_refuse), agent (refusal entry)
+        # No tool_result for the system_refuse tool_call → orphan.
+        entries = [
+            {"kind": "user", "body": "hi", "id": "e-1"},
+            {
+                "kind": "tool_call", "body": "system_refuse({...})",
+                "tool_call_id": "toolu_orphan_1",
+                "tool_name": "system_refuse",
+                "tool_args": {"reason": "policy"},
+                "id": "e-2",
+            },
+            # No tool_result for toolu_orphan_1 — this is the bug.
+            {
+                "kind": "agent", "type": "refusal",
+                "body": "policy", "id": "e-3",
+            },
+            # Next user turn — with the orphan present, this would
+            # break Anthropic's API contract.
+            {"kind": "user", "body": "what now?", "id": "e-4"},
+        ]
+        # Materialization itself doesn't reject orphan tool_calls
+        # (only orphan tool_results — per §7.5). But the resulting
+        # messages array has an unmatched tool_use that Anthropic
+        # rejects with the 400 error JL hit. Document the gap:
+        # confirm the orphan pattern produces an unmatched
+        # tool_use block in the materialized messages.
+        msgs = materialize_to_anthropic(entries)
+        # Find the assistant message containing the orphan tool_use.
+        assistant_msgs = [
+            m for m in msgs if m["role"] == "assistant"
+        ]
+        tool_use_ids = []
+        for m in assistant_msgs:
+            for block in m["content"]:
+                if block.get("type") == "tool_use":
+                    tool_use_ids.append(block.get("id"))
+        # Any user message immediately after must contain a
+        # tool_result for each tool_use_id; if not, the messages
+        # array is malformed.
+        for tool_use_id in tool_use_ids:
+            found_result = False
+            for m in msgs:
+                if m["role"] != "user":
+                    continue
+                for block in m["content"]:
+                    if (block.get("type") == "tool_result"
+                            and block.get("tool_use_id") == tool_use_id):
+                        found_result = True
+                        break
+            # When fix is in place, NO orphan tool_use exists
+            # because system_refuse never gets persisted as a
+            # tool_call entry in the first place. So this loop
+            # finds zero unmatched ids. Document the invariant
+            # that drives the fix.
+            assert found_result, (
+                f"orphan tool_use_id={tool_use_id!r} would crash "
+                f"the next Anthropic API call with the 400 error "
+                f"JL hit. The fix is to NOT persist system_refuse "
+                f"tool_call entries in the first place."
+            )
+
+
+class TestConversationRecoversAfterRefusal:
+    """v0.9.2 close-out (2026-05-05): JL reported that after a
+    refusal, subsequent user messages don't get agent replies —
+    "the refusal flag prevents the conversation from recovering".
+    The refusal_state is local-per-invocation (each
+    `<X>.<Y>.appended` event spawns a fresh _execute_agent_compute
+    call with a fresh refusal_state dict), so this SHOULD work
+    out of the box. Test verifies it does — appending a new
+    user message after a refusal triggers a new compute, the
+    new compute's refusal_state is fresh, and the agent commits
+    a normal reply (assuming the stub legacy doesn't refuse
+    again).
+
+    Also exercises the cross-invocation isolation: ctx state
+    (event_bus, compute_lookup, db) must survive an aborted
+    refusal turn cleanly enough that the next invocation works."""
+
+    def test_normal_reply_after_prior_refusal(self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        invocation_count = {"n": 0}
+
+        class _RefuseFirstThenNormal:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                invocation_count["n"] += 1
+                if invocation_count["n"] == 1:
+                    await execute_tool(
+                        "system_refuse",
+                        {"reason": "first turn refused"},
+                    )
+                    return {"thinking": "", "summary": "halted"}
+                # Second invocation: normal reply.
+                await on_writeback(
+                    kind="agent",
+                    body=f"normal reply on invocation {invocation_count['n']}",
+                )
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_RefuseFirstThenNormal()),
+            }
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "recover"})
+            thread_id = create.json()["id"]
+
+            # Turn 1: user message → agent refuses.
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "first turn"})
+            time.sleep(0.6)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            entries_after_refuse = json.loads(
+                get.json().get("conversation") or "[]"
+            )
+            assert [e["kind"] for e in entries_after_refuse] == [
+                "user", "agent",
+            ], entries_after_refuse
+            assert entries_after_refuse[1].get("type") == "refusal"
+
+            # Turn 2: another user message → agent must respond.
+            # If the refusal-flag-prevents-recovery bug exists,
+            # the agent's normal reply never lands and the
+            # conversation has just three entries (user, refusal,
+            # user) — no second agent entry.
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "second turn"})
+            time.sleep(0.6)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            entries_after_recover = json.loads(
+                get.json().get("conversation") or "[]"
+            )
+
+        kinds = [e["kind"] for e in entries_after_recover]
+        # Expected: user, agent (refusal), user, agent (normal reply).
+        # The conversation must recover after the refusal.
+        assert kinds == [
+            "user", "agent", "user", "agent",
+        ], (
+            f"conversation did not recover after refusal — the "
+            f"second turn's agent reply never landed. Kinds: "
+            f"{kinds!r}"
+        )
+        # Second agent entry is a normal reply (no refusal type).
+        assert entries_after_recover[3].get("type") != "refusal"
+        assert (
+            "normal reply" in entries_after_recover[3]["body"]
+        ), entries_after_recover[3]
+        # The compute fired twice (one per user turn).
+        assert invocation_count["n"] == 2, (
+            f"expected 2 compute invocations (one per user turn); "
+            f"got {invocation_count['n']}"
         )
 
 

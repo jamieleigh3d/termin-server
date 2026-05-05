@@ -337,12 +337,36 @@ def materialize_to_anthropic(entries) -> list[dict]:
       - tool_result with tool_call_id that doesn't match a prior
         tool_call entry (orphan).
 
+    v0.9.2 close-out (2026-05-05): orphan tool_call entries (a
+    tool_call with no matching tool_result) are SILENTLY DROPPED.
+    Anthropic rejects messages arrays with unmatched tool_use
+    blocks (HTTP 400: "tool_use ids were found without tool_result
+    blocks immediately after"). The runtime never writes orphan
+    tool_calls in v0.9.2+ (system_refuse intentionally skips
+    on_writeback per ai_provider's loop), but JL's local SQLite
+    from earlier testing contains the legacy orphan pattern.
+    Skipping at materialization time means existing chats recover
+    cleanly without requiring a data migration.
+
     Adjacent same-role entries merge into one message with the
     blocks concatenated (Anthropic requires alternating user/
     assistant roles).
     """
     if not entries:
         return []
+
+    # First pass: build the set of tool_call_ids that have matching
+    # tool_results. Orphan tool_calls (no matching result) get
+    # dropped at materialization time per the v0.9.2 close-out
+    # mitigation.
+    matched_tool_call_ids: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "tool_result":
+            tcid = entry.get("tool_call_id", "")
+            if tcid:
+                matched_tool_call_ids.add(tcid)
 
     seen_tool_call_ids: set[str] = set()
     messages: list[dict] = []
@@ -358,6 +382,12 @@ def materialize_to_anthropic(entries) -> list[dict]:
         # we don't half-build a turn before failing.
         if kind == "tool_call":
             tcid = entry.get("tool_call_id", "")
+            # Orphan tool_call (no matching tool_result later in
+            # the conversation) — drop. Common case: legacy
+            # system_refuse entries from before the v0.9.2
+            # close-out fix that stopped persisting them.
+            if tcid and tcid not in matched_tool_call_ids:
+                continue
             if tcid:
                 seen_tool_call_ids.add(tcid)
         elif kind == "tool_result":
@@ -1459,6 +1489,32 @@ class AIProvider:
                             "thinking": "",
                             "summary": "halted (refused)",
                         }
+                # v0.9.2 close-out (2026-05-05): system_refuse is
+                # internal agent-loop protocol, NOT a chat-surface
+                # message. Skip the on_writeback calls so neither
+                # the tool_call nor the tool_result entries land
+                # on the conversation field — the post-loop
+                # refusal-append (kind="agent" type="refusal") is
+                # the chat-surface representation of the refusal.
+                #
+                # Without this, the tool_call entry persists but
+                # the tool_result entry is short-circuited by the
+                # runtime's refusal_state check (introduced
+                # earlier this session). Next user message ->
+                # materialize_to_anthropic emits an orphan
+                # tool_use block -> Anthropic rejects with:
+                #   "tool_use ids were found without tool_result
+                #    blocks immediately after"
+                # This was JL's "conversation can't recover after
+                # refusal" report.
+                if tc.name == "system_refuse":
+                    raw_args = tc.input if isinstance(tc.input, dict) else {}
+                    await execute_tool(tc.name, raw_args)
+                    # No on_writeback. No append to tool_results
+                    # either — the running_messages array won't
+                    # be sent again because should_halt fires at
+                    # the top of the next iteration.
+                    continue
                 raw_args = tc.input if isinstance(tc.input, dict) else {}
                 # v0.9.2 close-out: extract `purpose` (if supplied)
                 # before passing args to the tool. The runtime
