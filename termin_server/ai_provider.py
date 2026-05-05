@@ -14,6 +14,7 @@ Built-in providers: Anthropic (Claude) and OpenAI (GPT).
 Provider is selected via deploy config ai_provider section.
 """
 
+import asyncio
 import json
 import logging
 from typing import Any, Optional
@@ -1180,6 +1181,7 @@ class AIProvider:
         on_writeback: Any,
         on_text_delta: Any = None,
         on_text_end: Any = None,
+        should_halt: Any = None,
         on_event: Any = None,
         max_turns: int = 20,
     ) -> dict:
@@ -1226,7 +1228,7 @@ class AIProvider:
             return await self._anthropic_agent_loop_with_conversation(
                 system_prompt, messages, tools, execute_tool,
                 on_writeback, on_text_delta, on_text_end,
-                on_event, max_turns,
+                should_halt, on_event, max_turns,
             )
         # OpenAI conversation-mode is out of v0.9.2 scope; the
         # analyzer-side check (TERMIN-S061 etc) doesn't gate on
@@ -1246,6 +1248,7 @@ class AIProvider:
         on_writeback,
         on_text_delta,
         on_text_end,
+        should_halt,
         on_event,
         max_turns: int,
     ) -> dict:
@@ -1281,6 +1284,23 @@ class AIProvider:
         running_messages = list(messages)
 
         for turn in range(max_turns):
+            # v0.9.2 close-out: refusal-terminates-loop. The
+            # runtime supplies `should_halt` as a closure over its
+            # `refusal_state`; if system_refuse fired during a
+            # prior turn, we stop here instead of issuing another
+            # provider call. The post-loop refusal-append path
+            # (L7.4) writes the refusal entry as the last commit
+            # on the conversation field. Per compute-contract.md
+            # §6.1: "the loop terminates; staged outputs are
+            # discarded."
+            if should_halt is not None:
+                halt = should_halt() if not asyncio.iscoroutinefunction(
+                    should_halt) else await should_halt()
+                if halt:
+                    return {
+                        "thinking": "",
+                        "summary": "halted (refused)",
+                    }
             # Per-turn state. The producer thread iterates the
             # synchronous Anthropic stream and pushes text_delta
             # events onto a queue; the async consumer (us) drains
@@ -1375,6 +1395,19 @@ class AIProvider:
             })
             tool_results = []
             for tc in tool_calls:
+                # Mid-turn halt check: if a prior tool call in this
+                # same response (e.g., system_refuse) flipped the
+                # halt signal, drop the rest of the batch. The
+                # post-loop refusal-append path still writes the
+                # refusal entry as the last commit on the field.
+                if should_halt is not None:
+                    halt = should_halt() if not asyncio.iscoroutinefunction(
+                        should_halt) else await should_halt()
+                    if halt:
+                        return {
+                            "thinking": "",
+                            "summary": "halted (refused)",
+                        }
                 raw_args = tc.input if isinstance(tc.input, dict) else {}
                 # v0.9.2 close-out: extract `purpose` (if supplied)
                 # before passing args to the tool. The runtime

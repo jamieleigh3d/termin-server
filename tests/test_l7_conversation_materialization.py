@@ -376,7 +376,7 @@ class _TextOnlyStubLegacy:
     async def agent_loop_with_conversation(
         self, directive, messages, tools, execute_tool,
         on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
     ):
         self.last_directive = directive
         self.last_messages = messages
@@ -397,7 +397,7 @@ class _ToolUsingStubLegacy:
     async def agent_loop_with_conversation(
         self, directive, messages, tools, execute_tool,
         on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
     ):
         self.last_messages = messages
         # Turn 1: write a tool_call entry, execute the tool, write a
@@ -586,7 +586,7 @@ class TestStreamingTextDeltas:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-                on_event=None, max_turns=20,
+                should_halt=None, on_event=None, max_turns=20,
             ):
                 if on_text_delta:
                     await on_text_delta("Hello ")
@@ -659,7 +659,7 @@ class TestStreamingTextDeltas:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-                on_event=None, max_turns=20,
+                should_halt=None, on_event=None, max_turns=20,
             ):
                 # Turn 1: stream thinking text, then call a tool.
                 if on_text_delta:
@@ -721,6 +721,149 @@ class TestStreamingTextDeltas:
         assert ends[1]["committed"] is True   # final turn
 
 
+class TestRefusalTerminatesLoop:
+    """v0.9.2 close-out: per compute-contract.md §6.1, system_refuse
+    must terminate the agent loop. The runtime supplies should_halt
+    as a closure over refusal_state; the AI provider checks it
+    between turns and between mid-turn tool calls. Post-refusal
+    on_writeback calls short-circuit so no further entries land on
+    the conversation field — the refusal entry (appended by L7.4
+    post-loop) is the last commit.
+
+    Without this enforcement, an agent could call system_refuse
+    and then keep calling other tools (content_create, etc.) —
+    side effects would still fire, audit incoherence
+    (outcome=refused but conversation has post-refusal entries),
+    and the platform's enforcement-over-vigilance promise would
+    be advisory at best."""
+
+    def test_should_halt_skips_subsequent_turns(self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        turns_executed = {"count": 0}
+
+        class _ChattyAfterRefuseLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                # Turn 1: refuse, then "continue" to attempt more
+                # tool calls + a text commit. The runtime's
+                # short-circuits should prevent any of the
+                # post-refusal effects from landing.
+                for turn in range(5):
+                    if should_halt and should_halt():
+                        return {"thinking": "", "summary": "halted"}
+                    turns_executed["count"] += 1
+                    if turn == 0:
+                        # First turn: fire system_refuse.
+                        await execute_tool(
+                            "system_refuse",
+                            {"reason": "policy: cannot do this"},
+                        )
+                        # An agent might continue trying things.
+                        # Each subsequent on_writeback should be
+                        # short-circuited; each subsequent
+                        # execute_tool should error out.
+                        continue
+                    # Post-refuse turns: try to commit text + call
+                    # a tool. These should all be no-ops.
+                    await on_writeback(
+                        kind="assistant",
+                        body=f"chatty followup turn {turn}",
+                    )
+                return {"thinking": "", "summary": "completed"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_ChattyAfterRefuseLegacy()),
+            }
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "halt"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "do something bad"})
+            time.sleep(0.7)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+
+        # Only the user entry + the refusal entry are on the field.
+        # No "chatty followup turn N" assistant entries committed
+        # despite the stub trying to write them. should_halt
+        # caused the loop to bail; on_writeback short-circuited
+        # the writes that did fire.
+        kinds = [e["kind"] for e in entries]
+        assert kinds == ["user", "assistant"], entries
+        assert entries[1].get("type") == "refusal"
+        assert "policy" in entries[1]["body"]
+        # No body text from the stub's chatty followups landed.
+        bodies = [e.get("body", "") for e in entries]
+        for b in bodies:
+            assert "chatty followup" not in b, (
+                f"post-refusal commit leaked through: {bodies!r}"
+            )
+
+    def test_post_refusal_tool_call_returns_error(self, tmp_path):
+        """Defensive: even if a future provider doesn't honor
+        should_halt and tries to call another tool after refusal,
+        the runtime's _execute_tool gate returns an error envelope
+        rather than executing."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        post_refuse_results = []
+
+        class _IgnoreHaltLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                # Refuse first.
+                await execute_tool(
+                    "system_refuse", {"reason": "no"},
+                )
+                # Pretend the provider ignores should_halt and
+                # tries another tool. The runtime's tool gate
+                # should return an error envelope.
+                result = await execute_tool(
+                    "content_query",
+                    {"content_name": "chat_threads"},
+                )
+                post_refuse_results.append(result)
+                return {"thinking": "", "summary": "completed"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_IgnoreHaltLegacy()),
+            }
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "gate"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "x"})
+            time.sleep(0.5)
+
+        assert len(post_refuse_results) == 1
+        assert "error" in post_refuse_results[0], (
+            f"post-refusal tool call should return an error envelope; "
+            f"got {post_refuse_results[0]!r}"
+        )
+
+
 class TestRefusalRegressionUnderL71:
     """L7.4's refusal-append path must keep working under L7.1's new
     dispatch — refusal still wins over normal write-back when
@@ -734,7 +877,7 @@ class TestRefusalRegressionUnderL71:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
             ):
                 # Refuse via the runtime-gated tool; do NOT call
                 # on_writeback for normal text — refusal path owns the
@@ -824,7 +967,7 @@ class TestAgentChatbotV092EndToEnd:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
             ):
                 self.calls.append({"messages": messages})
                 # Pull the most recent user-role text block.
@@ -908,7 +1051,7 @@ class TestAgentChatbotV092EndToEnd:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
             ):
                 await execute_tool(
                     "system_refuse",
@@ -991,7 +1134,7 @@ class TestPurposeFieldOnToolCallEntry:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
             ):
                 await on_writeback(
                     kind="tool_call",
@@ -1198,7 +1341,7 @@ As an anonymous, I want to chat:
             async def agent_loop_with_conversation(
                 self, directive, messages, tools, execute_tool,
                 on_writeback, on_text_delta=None, on_text_end=None,
-        on_event=None, max_turns=20,
+        should_halt=None, on_event=None, max_turns=20,
             ):
                 # Verify current_time is in the tool surface.
                 captured_tools["names"] = [t["name"] for t in tools]

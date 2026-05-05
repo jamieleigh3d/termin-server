@@ -684,19 +684,30 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
     async def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         db = await get_db(ctx.db_path)
         try:
-            # v0.9 Phase 3 slice (e): system_refuse capture. Recorded
-            # in refusal_state; the legacy agent loop continues to
-            # call other tools until it hits set_output or max_turns,
-            # but post-loop we override the outcome to "refused" and
-            # discard any output. Slice (f)/v1.0 may add a
-            # halt-on-refuse semantics to the contract methods so the
-            # loop terminates immediately.
+            # v0.9 Phase 3 slice (e): system_refuse capture.
+            # v0.9.2 close-out: the AI provider now honors
+            # `should_halt` between turns AND between tools in a
+            # multi-tool batch — once refusal_state is set, no
+            # further tool calls land here. This branch is the
+            # defensive guard for any future provider that doesn't
+            # check should_halt: a non-refuse tool reaching here
+            # AFTER a refusal returns an error envelope rather
+            # than executing. The post-loop refusal-append path
+            # (L7.4) writes the refusal entry as the last commit
+            # on the conversation field per compute-contract.md
+            # §6.1.
             if tool_name == "system_refuse":
                 if not refusal_state:
                     refusal_state["reason"] = str(
                         tool_input.get("reason", "")
                     ).strip()
                 return {"acknowledged": True}
+            if refusal_state.get("reason"):
+                return {"error": (
+                    "Invocation refused; further tool calls are not "
+                    "permitted. The runtime has terminated this "
+                    "agent loop and is appending the refusal entry."
+                )}
 
             if tool_name == "content_query":
                 cname = tool_input.get("content_name", "")
@@ -944,7 +955,17 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
         the provider supplies kind, body, and the structured fields
         per kind (tool_call_id, tool_name, tool_args for tool_call;
         tool_call_id, is_error for tool_result).
+
+        v0.9.2 close-out: refusal short-circuit. Once
+        ``refusal_state`` is set (system_refuse fired earlier this
+        invocation), no further commits land on the conversation
+        field through this callback. The post-loop refusal-append
+        path writes the refusal entry as the last commit. Per
+        compute-contract.md §6.1: "the loop terminates; staged
+        outputs are discarded."
         """
+        if refusal_state.get("reason"):
+            return
         from .routes import (
             _do_append, AppendValidationError, AppendNotFoundError,
         )
@@ -1051,11 +1072,21 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 envelope["data"] = dict(envelope)
                 await ctx.event_bus.publish(envelope)
 
+            # v0.9.2 close-out: should_halt is the runtime->provider
+            # signal that the agent loop must terminate (e.g.,
+            # system_refuse fired). Per compute-contract.md §6.1
+            # the loop must terminate on refusal; should_halt is
+            # the mechanism that lets the provider check between
+            # turns + between mid-turn tool calls.
+            def _should_halt():
+                return bool(refusal_state.get("reason"))
+
             result = await legacy.agent_loop_with_conversation(
                 system_msg, messages, all_tools, _execute_tool,
                 on_writeback=_on_writeback,
                 on_text_delta=_on_text_delta,
                 on_text_end=_on_text_end,
+                should_halt=_should_halt,
             )
         elif ctx.event_bus is not None and hasattr(
                 legacy, "agent_loop_streaming"):
