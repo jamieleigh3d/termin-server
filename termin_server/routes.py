@@ -629,7 +629,15 @@ async def _do_append(
     # shared helper (not the REST route) so the WS frame handler (L4)
     # also fires the event without any duplication.
     if ctx.event_bus is not None:
-        await ctx.event_bus.publish({
+        # The event envelope. We duplicate it under `data` so the WS
+        # forwarder's payload-unwrap (conn_manager.broadcast_to_subscribers
+        # — `event.get("data") or event.get("record") or event`) ends up
+        # forwarding the full envelope (with `appended_entry`) to JS
+        # subscribers, NOT just the `record` (which would lose the
+        # appended_entry the chat hydrator needs to render the new bubble).
+        # Other fields are kept at the top level for any in-process
+        # subscriber that walks the dict directly.
+        envelope = {
             "type": f"{content_ref}_{field_name}_appended",
             "channel_id": f"content.{content_ref}.{field_name}.appended",
             "content_name": content_ref,
@@ -640,7 +648,9 @@ async def _do_append(
             "triggered_at": entry["created_at"],
             "invoked_by_principal_id": entry["appended_by_principal_id"],
             "trigger_kind": "crud-append",
-        })
+        }
+        envelope["data"] = dict(envelope)
+        await ctx.event_bus.publish(envelope)
 
     # v0.9.2 L5: dispatch listener computes that triggered on this
     # event. Mirrors the per-CRUD-verb dispatch path used by

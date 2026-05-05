@@ -1179,6 +1179,13 @@ function hydrateAggregations() {
 function hydrateOneForm(form) {
   // Skip the role-switcher form
   if (form.action && form.action.includes("/set-role")) return;
+  // Skip forms that opt out of the generic AJAX-submit interceptor.
+  // v0.9.2: the conversation-field chat form owns its own submit
+  // path (sendAppendFrame via the WS L4 append frame); the generic
+  // interceptor would just try to fetch the form's action URL and
+  // either succeed at the page URL (wrong endpoint) or fail (when
+  // action is javascript:void(0)). Either way, wrong shape.
+  if (form.hasAttribute("data-termin-no-default-submit")) return;
   if (form._terminHydrated) return;
   form._terminHydrated = true;
 

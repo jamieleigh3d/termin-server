@@ -749,15 +749,22 @@ def _render_chat_conversation(node: dict) -> str:
         f'  <div class="border-t p-3" data-termin-chat-input>',
         # The L4 WS append frame is the send path. The hydrator's
         # submit listener intercepts and routes via sendAppendFrame().
-        # Defensive: action="javascript:void(0)" + onsubmit="return false"
-        # ensure the form is a no-op on default submit if the user
-        # hits Enter / Send during the bootstrap window before the
-        # JS hydrator has bound its listener (without these the form
-        # would POST to the page URL — 405 Method Not Allowed). The
-        # data-termin attributes carry everything; the hydrator owns
-        # all writes.
+        # Defensive layering for the bootstrap-window race (form is
+        # in DOM before JS hydrator binds its preventDefault listener):
+        #   1. data-termin-no-default-submit: signal to hydrateForms()'s
+        #      generic AJAX-submit interceptor to skip this form (the
+        #      chat-specific hydrator owns the submit path; the generic
+        #      one would just try to fetch the action URL and fail).
+        #   2. onsubmit="return false": belt-and-suspenders against the
+        #      form's natural default submit if any handler bails.
+        # NOT setting `action`: an explicit `action` like
+        # `javascript:void(0)` is rejected by the AJAX interceptor's
+        # fetch() (URL scheme not supported). The implicit default
+        # action is the page URL, which onsubmit="return false"
+        # blocks anyway.
         f'    <form class="flex space-x-2" data-termin-chat-form'
-        f' action="javascript:void(0)" onsubmit="return false">',
+        f' data-termin-no-default-submit'
+        f' onsubmit="return false">',
         f'      <input type="text" name="body" placeholder="Type a message..."'
         f' aria-label="Message text"'
         f' class="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"'
