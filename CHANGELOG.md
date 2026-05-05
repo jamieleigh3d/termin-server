@@ -5,6 +5,194 @@ All notable changes to `termin-server` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-05-05
+
+Conversation-field runtime release. Implements the runtime side of
+the v0.9.2 IR additions landed in `termin-compiler` and `termin-core`:
+SQL storage for the new `structured` and `conversation` base types,
+the `POST <resource>/{id}/<field>:append` REST handler + WebSocket
+parity frame, the `content.<source>.<field>.appended` event channel,
+conversation materialization to Anthropic with auto-write-back per
+§11.5, token streaming for conversation-mode agents, and the chat
+presentation hydrator. Also lands the `system_refuse(reason)` →
+hard-stop contract enforcement, the `assistant` → `agent` kind
+rename with UI rebrand to "AI Agent", and a clutch of chat-surface
+fixes from JL's manual testing.
+
+### Added
+
+- **L1 — `structured` SQL type** (`storage.py::_SQL_TYPES`). Maps
+  the new IR base type to TEXT storage; serialized/deserialized
+  via JSON at the boundary.
+- **L2 — `conversation` SQL type** (`storage.py::_SQL_TYPES`).
+  Same TEXT storage as `structured`; the runtime treats the JSON
+  shape as a typed list of entries with the §3.2 closed kind enum.
+- **L3 — append handler** (`routes.py::_do_append`).
+  `POST /api/v1/<resource>/{id}/<field>:append` reads the request
+  body as a partial entry envelope, validates against the
+  conversation-entry shape (kind enum, body shape, optional
+  parent_id / tool_call_id / purpose linkage), assigns id +
+  timestamp, appends to the parent record's conversation field,
+  writes a `Verb.APPEND` audit row, and returns the materialized
+  `appended_entry`.
+- **L4 — WebSocket append frame parity** (`conn_manager.py`).
+  Clients can append via the same WS that drives subscriptions:
+  `{type: "append", resource, id, field, payload}`. Same gating
+  as the REST path, same audit trail. The chat hydrator uses this
+  frame so the user→assistant turnaround happens on one socket
+  with no extra HTTP round-trip.
+- **L5 — `content.<source>.<field>.appended` event publish**
+  (`routes.py::_do_append`). Every successful append publishes
+  the appended entry on the `content.<source>.<field>.appended`
+  event-bus channel. Author-declared When rules with
+  `where appended_entry.kind == "..."` predicates fire from
+  this; the chat hydrator's WS subscription consumes it for
+  live UI updates.
+- **L7.1+L7.2+L7.3 — conversation materialization to Anthropic**
+  (`ai_provider.py::materialize_to_anthropic`). Walks the
+  conversation entries and emits an Anthropic `messages` list
+  with adjacent-role merging, `tool_use` / `tool_result`
+  pairing validation, and orphan-tool-call dropping (legacy
+  data hygiene). Honors the closed kind enum: `user` → `user`,
+  `agent` / `assistant` → `assistant`, `tool_call` → `assistant`
+  with `tool_use` block, `tool_result` → `user` with
+  `tool_result` block, `system_event` → skipped (consumed by the
+  audit layer, not the agent context).
+- **§11.5 auto-write-back** (`compute_runner.py::_on_writeback`).
+  After the agent loop terminates, the runtime appends the
+  agent's text reply to the conversation field as a fresh
+  `kind="agent"` entry — the author-declared compute does not
+  have to write the reply back manually. Works for both
+  blocking and streaming providers.
+- **L7.5 — refusal as `kind="agent"` `type="refusal"`**
+  (`compute_runner.py`). `system_refuse(reason)` now records the
+  refusal as a conversation entry instead of writing to the
+  retired `compute_refusals` sidecar. The conversation timeline
+  carries the refusal next to the user message that triggered
+  it; audit-trail coverage is unchanged.
+- **L8 — When-rule action dispatch + Append-action executor**
+  (`compute_runner.py`). When rules with action lists land each
+  action through the verb-specific dispatcher; Append-actions
+  go through the same `_do_append` path as the REST/WS surface.
+- **L9 — Tailwind chat hydrator for the v0.9.2 conversation
+  binding** (`presentation.py::_render_chat_conversation`,
+  `static/termin.js::hydrateConversationFieldChat`). SSR shell
+  carries `data-termin-source` + `data-termin-conversation-field`;
+  the hydrator subscribes to the L5 event channel, fetches the
+  active record's conversation, renders one bubble per entry,
+  and binds the input form to the L4 WS append frame.
+- **L11 — agent_chatbot end-to-end coverage**
+  (`tests/test_l11_agent_chatbot.py`). Tests append authorization,
+  append validation, append → trigger → agent_loop → write-back
+  round-trip, streaming delta delivery, thread switching, history
+  load, refusal termination.
+- **`purpose` field on tool_call entries** (close-out task).
+  Optional 6-word-or-less display string for tool-call entries
+  in the conversation timeline. Hard-truncated at 12 words with
+  ellipses. Tool-binding wires Anthropic's tool-use blocks to
+  display the `purpose` instead of the full tool input when
+  rendering bubbles.
+- **`Invokes "<compute>"` runtime wiring** (close-out task).
+  When an `ai-agent` Compute declares `Invokes "X"`, the
+  runtime registers `X` as a tool on the agent's tool list with
+  the gating from `X`'s access rules. Tool-call entries carry
+  the matching `purpose` description.
+- **Token streaming for conversation-mode agents**
+  (`ai_provider.py::_anthropic_agent_loop_with_conversation`).
+  Switches the Anthropic call to `messages.stream` and emits
+  `on_text_delta` / `on_text_end` callbacks; `compute_runner`
+  publishes them to the `content.<source>.<field>.streaming`
+  channel; the chat hydrator subscribes and renders into a
+  pending bubble until `on_text_end` fires, then replaces with
+  the persisted entry from the L5 channel.
+
+### Changed
+
+- **`assistant` → `agent` kind rename + UI rebrand to "AI
+  Agent"** (close-out task). Canonical kind for AI-agent
+  entries is now `agent`. Schema validator and materializer
+  accept both `agent` and `assistant` for back-compat; new
+  writes are `agent`. UI labels updated: bubble attribution
+  reads "AI Agent" (was "Assistant"), refusal banner reads
+  "AI Agent refused" (was "Refused"). JL: "we should not call
+  the AI 'Assistant' in our system."
+- **`system_refuse(reason)` is hard-terminating per §6.1**
+  (`compute_runner.py`, `ai_provider.py`). The agent loop
+  short-circuits on the first `system_refuse` tool call: the
+  refusal entry lands in the conversation, the response stream
+  hard-stops, no further tool calls or text deltas are emitted
+  for the same invocation. Three-layer enforcement (provider
+  `should_halt`, runtime `_on_writeback` short-circuit,
+  `_execute_tool` defensive gate) — belt-and-suspenders for
+  the trust boundary. Tenet 2 (enforcement over vigilance):
+  authors should not have to remember to short-circuit on
+  refuse; the platform enforces it.
+
+### Fixed
+
+- **Chat surface — bootstrap-window form submit race** (`static/
+  termin.js`, `presentation.py`). Generic AJAX form interceptor
+  used to fire on the chat input form before the chat-specific
+  hydrator bound its `preventDefault` listener, racing with the
+  send-via-WS path. Two layered defenses: chat form opts out via
+  `data-termin-no-default-submit`; `onsubmit="return false"`
+  blocks any natural default submit if the opt-out is missed.
+- **Chat surface — tool_result orphan pairing**
+  (`hydrateConversationFieldChat::_attachToolResultToCall`).
+  v0.9.2 conversation timeline pairs `tool_call` with its
+  `tool_result` by `tool_call_id`; the hydrator now attaches
+  the result inline under the call rather than rendering a
+  standalone "Tool result (unknown, orphan)" bubble.
+- **Chat surface — history load on page refresh.**
+  Conversation field returned by SQLite GET arrives as a JSON
+  string; `_coerceEntries` parses it before render so the
+  history shows up on first paint instead of staying empty
+  until the next append fires.
+- **Chat surface — thread switching UI.** Clickable thread rows
+  in the data_table picker (event delegation on the table
+  element so WS-pushed new rows pick up the click handler
+  without re-hydration). Header carries a "+ New chat" button
+  that creates a fresh parent record and switches the chat to
+  it. NB: the table → chat coupling is implicit (table is a
+  picker if its `source` matches the chat's `source` and they
+  co-occur on the page); see the v0.10 backlog item "Explicit
+  picker binding for chat-driving tables" for the planned
+  DSL-level fix.
+- **Chat surface — WS push envelope.** v0.9.2 broadcast
+  unwrapped to `event.get("record")`, dropping the
+  `appended_entry` envelope the hydrator needs. Wraps the
+  publish in a `data:` key so the conn_manager unwrap picks the
+  full envelope.
+- **`system_refuse` orphan tool_call breaking next turn.** The
+  refusal tool_call entry was being persisted to the
+  conversation, then `_on_writeback` short-circuited so no
+  matching `tool_result` ever appeared. The next agent turn
+  failed Anthropic 400 ("`tool_use` ids found without
+  `tool_result` blocks immediately after"). Three fixes:
+  (1) skip `_on_writeback` entirely for `system_refuse` calls;
+  (2) drop orphan `tool_call` entries in
+  `materialize_to_anthropic` for legacy data;
+  (3) longer drain in `_close_bg_loop_cleanly` so aiosqlite
+  worker callbacks land before the bg loop closes.
+- **aiosqlite race with bg-loop close**
+  (`app.py::_close_bg_loop_cleanly`). Drains pending tasks +
+  calls `shutdown_asyncgens` + `asyncio.sleep(0.1)` before
+  closing the bg event loop so aiosqlite worker callbacks
+  don't land on a closed loop. Replaces the bare
+  `bg_loop.close()` that was raising "Event loop is closed"
+  tracebacks during refusals.
+
+### Suite
+
+98 tests passing on Windows (was 24; +74 from L1–L11 across
+storage, append handler, WS frame, materialization, write-back,
+streaming, refusal termination, kind rename back-compat, chat
+hydrator e2e, and the close-out hotfixes). End-to-end manual
+verification by JL on `agent_chatbot`: streaming visible,
+`system_refuse` terminates cleanly, recovery turn after refuse
+works, history loads on refresh, thread switching works, "AI
+Agent" label correct.
+
 ## [0.9.1] — 2026-05-01
 
 Correctness + hygiene patch on top of v0.9.0. Closes the audit-trail

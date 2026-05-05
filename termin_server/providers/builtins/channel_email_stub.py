@@ -128,7 +128,7 @@ def register_email_stub(
         product_name="stub",
         factory=_email_stub_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         features=["send"],
         contract_registry=contract_registry,
     )

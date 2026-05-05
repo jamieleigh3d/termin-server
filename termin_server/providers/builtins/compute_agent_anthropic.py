@@ -422,6 +422,6 @@ def register_anthropic_agent(
         product_name="anthropic",
         factory=_anthropic_agent_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         contract_registry=contract_registry,
     )

@@ -903,12 +903,13 @@ class TestReflection:
     def test_runtime_registry_endpoint(self, warehouse_client):
         """``/runtime/registry`` advertises the application's
         boundaries + transport URLs; clients use it to wire up
-        WebSocket and REST endpoints. v0.9.1 emits a runtime_version
-        of 0.9.1."""
+        WebSocket and REST endpoints. v0.9.2 emits a runtime_version
+        of 0.9.2 (release moved in lockstep with the rest of the
+        Termin v0.9 family)."""
         resp = warehouse_client.get("/runtime/registry")
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body.get("runtime_version") == "0.9.1"
+        assert body.get("runtime_version") == "0.9.2"
         assert "boundaries" in body
         assert body.get("application") == "Warehouse Inventory Manager"
 

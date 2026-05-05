@@ -208,7 +208,7 @@ def register_messaging_stub(
         product_name="stub",
         factory=_messaging_stub_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         features=["send", "update", "react", "subscribe"],
         contract_registry=contract_registry,
     )

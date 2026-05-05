@@ -110,7 +110,7 @@ def register_webhook_stub(
         product_name="stub",
         factory=_webhook_stub_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         features=["send"],
         contract_registry=contract_registry,
     )

@@ -1140,6 +1140,6 @@ def register_sqlite_storage(
         product_name="sqlite",
         factory=_sqlite_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         contract_registry=contract_registry,
     )

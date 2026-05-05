@@ -39,12 +39,37 @@ termin-conformance (spec + tests; runs against any termin-core-conforming
 
 ## Status
 
-**v0.9.0 — released 2026-04-30.** Phase 7 of the v0.9 milestone
-extracted this package out of `termin-compiler/termin_runtime/`
-(slice 7.3) and dropped the back-compat shim layer in
-`termin-compiler` (slice 7.5a). `termin-compiler` now imports
-`from termin_server import create_termin_app` directly; alternate
-runtimes built on `termin-core` do not depend on `termin-server`.
+**v0.9.2 — released 2026-05-05.** The conversation-field runtime
+release. Implements the runtime side of the v0.9.2 IR additions
+landed in `termin-compiler` and `termin-core`: SQL storage for the
+new `structured` and `conversation` base types, the
+`POST <resource>/{id}/<field>:append` REST handler + WebSocket
+parity frame, the `content.<source>.<field>.appended` event
+channel, conversation materialization to Anthropic with
+auto-write-back per §11.5, token streaming for conversation-mode
+agents, the chat presentation hydrator, and the
+`system_refuse(reason)` → terminate-loop contract enforcement. Also
+renames the canonical kind `assistant` → `agent` (with
+`assistant` accepted as legacy back-compat) and rebrands the chat
+UI label to "AI Agent." See [CHANGELOG.md](CHANGELOG.md) for the
+full list. 98 tests passing.
+
+### v0.9 release arc
+
+- **v0.9.0** (2026-04-30) — opening release. Phase 7 of the v0.9
+  Termin milestone extracted this package out of
+  `termin-compiler/termin_runtime/` (slice 7.3); the legacy shim
+  was dropped in slice 7.5a. `termin-compiler` now imports
+  `from termin_server import create_termin_app` directly;
+  alternate runtimes built on `termin-core` do not depend on
+  `termin-server`.
+- **v0.9.1** (2026-05-01) — correctness + hygiene patch. Closed
+  audit-trail gaps surfaced by the Phase 3 conformance pack
+  (manual-trigger CEL audit, anonymous-principal stamping),
+  fixed the stale-action hydrator on warehouse, and made
+  `surface-as-error` channel failure mode behave deterministically
+  per the contract. 24 tests.
+- **v0.9.2** (2026-05-05) — conversation-field runtime; see above.
 
 ## Quick start
 

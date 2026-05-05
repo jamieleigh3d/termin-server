@@ -91,6 +91,6 @@ def register_default_cel(
         product_name="default-cel",
         factory=_default_cel_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         contract_registry=contract_registry,
     )

@@ -127,6 +127,6 @@ def register_stub_identity(
         product_name="stub",
         factory=_stub_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         contract_registry=contract_registry,
     )

@@ -123,6 +123,6 @@ def register_stub_llm(
         product_name="stub",
         factory=_stub_llm_factory,
         conformance="passing",
-        version="0.9.0",
+        version="0.9.2",
         contract_registry=contract_registry,
     )

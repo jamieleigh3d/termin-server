@@ -158,6 +158,6 @@ def register_tailwind_default(
             product_name="tailwind-default",
             factory=_tailwind_default_factory,
             conformance="passing",
-            version="0.9.0",
+            version="0.9.2",
             contract_registry=contract_registry,
         )
