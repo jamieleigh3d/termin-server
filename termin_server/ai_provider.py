@@ -78,6 +78,50 @@ _KINDS_ASSISTANT_ROLE = frozenset({"assistant", "tool_call"})
 
 _PURPOSE_MAX_WORDS = 12
 
+
+def _producer_for_conversation_stream(stream_events, put) -> None:
+    """v0.9.2 close-out: shared producer logic for the conversation-
+    mode Anthropic stream. Iterates the stream's events and forwards
+    text_delta payloads onto ``put`` (a thread-safe queue putter).
+
+    Drops further text_delta events after a content_block_start for
+    a tool_use block named ``system_refuse`` arrives — the post-
+    refuse text is "thinking" the model is producing on its way to
+    a turn end, NOT a commit-bound reply. Suppressing it here saves
+    the bridge queue overhead AND complements the runtime-side
+    enforcement in _on_text_delta (compute_runner).
+
+    Extracted as a free function so a unit test can drive it with a
+    scripted event sequence (no Anthropic SDK round-trip required).
+    The full Anthropic loop in
+    ``_anthropic_agent_loop_with_conversation`` calls this with
+    the live ``stream`` object (which is iterable like a list of
+    event objects).
+    """
+    refuse_seen = False
+    for event in stream_events:
+        etype = getattr(event, "type", None)
+        if etype == "content_block_start":
+            cb = getattr(event, "content_block", None)
+            if cb is not None and getattr(cb, "type", None) == "tool_use" \
+                    and getattr(cb, "name", None) == "system_refuse":
+                refuse_seen = True
+            continue
+        if etype != "content_block_delta":
+            continue
+        if refuse_seen:
+            # Drop everything after the refuse decision was
+            # signaled; the model is still emitting tokens but the
+            # runtime is about to halt, so no need to forward them.
+            continue
+        delta = getattr(event, "delta", None)
+        if delta is None:
+            continue
+        if getattr(delta, "type", None) == "text_delta":
+            text = getattr(delta, "text", "") or ""
+            if text:
+                put({"type": "text_delta", "text": text})
+
 _PURPOSE_TOOL_DESCRIPTION = (
     "Short, 6-words-or-less, plain-English description of why you're "
     "calling this tool — for chat-UI display. Examples: "
@@ -1319,17 +1363,14 @@ class AIProvider:
                         messages=running_messages,
                         tools=tools,
                     ) as stream:
-                        for event in stream:
-                            etype = getattr(event, "type", None)
-                            if etype != "content_block_delta":
-                                continue
-                            delta = getattr(event, "delta", None)
-                            if delta is None:
-                                continue
-                            if getattr(delta, "type", None) == "text_delta":
-                                text = getattr(delta, "text", "") or ""
-                                if text:
-                                    put({"type": "text_delta", "text": text})
+                        # v0.9.2 close-out: provider-side
+                        # refuse-detection. Once the stream emits a
+                        # content_block_start for tool_use named
+                        # system_refuse, no further text deltas
+                        # should reach the consumer. The runtime
+                        # also enforces this in _on_text_delta as a
+                        # belt-and-suspenders defense.
+                        _producer_for_conversation_stream(stream, put)
                         state["final_message"] = stream.get_final_message()
                 except Exception as exc:
                     state["error"] = exc
@@ -1853,15 +1894,27 @@ def build_agent_tools(accesses: list[str], content_lookup: dict) -> list[dict]:
         # the call in the audit + compute_refusals sidecar; the
         # invocation outcome becomes "refused" with the supplied
         # reason. Per BRD §6.3.3 + design §3.7.
+        # v0.9.2 close-out (2026-05-05): updated description for
+        # conversation-mode semantics. The legacy set_output sentinel
+        # doesn't exist on the conversation-mode tool surface; the
+        # runtime hard-stops the response stream the moment refuse
+        # fires (per compute-contract.md §6.1). Telling the agent
+        # "still call set_output" was producing the bug JL caught
+        # 2026-05-04 evening: the agent reasoned through the
+        # instruction, called refuse, then continued generating
+        # text trying to call set_output (which 404s as an unknown
+        # tool in conversation mode).
         {
             "name": "system_refuse",
             "description": (
                 "Refuse the requested work because it conflicts with "
                 "system policy or training-time constraints. Provide a "
-                "clear, structured reason. After calling this you "
-                "should still call set_output to terminate the loop "
-                "(set_output's content does not matter — the runtime "
-                "discards it on refusal)."
+                "clear, structured reason. After calling this, the "
+                "runtime will immediately terminate your response "
+                "stream and persist your refusal reason as the final "
+                "entry in the conversation. Do not generate any "
+                "additional text or call any further tools — anything "
+                "you produce after this call will be discarded."
             ),
             "input_schema": {
                 "type": "object",

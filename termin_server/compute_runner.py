@@ -1045,6 +1045,18 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
             async def _on_text_delta(text: str):
                 if ctx.event_bus is None:
                     return
+                # v0.9.2 close-out: runtime-level enforcement of
+                # refusal halt. Once refusal_state is set, no
+                # further text deltas reach the streaming
+                # channel — the chat UI's pending bubble stays at
+                # whatever pre-refuse text was streamed and gets
+                # cleared by on_text_end(committed=False). The
+                # provider also drops post-refuse deltas at the
+                # source via _producer_for_conversation_stream
+                # (cost optimization); this is the trust-boundary
+                # enforcement in case a future provider doesn't.
+                if refusal_state.get("reason"):
+                    return
                 envelope = {
                     "channel_id": stream_channel,
                     "type": "delta",

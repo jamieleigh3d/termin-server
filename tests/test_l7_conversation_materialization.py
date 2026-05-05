@@ -721,6 +721,203 @@ class TestStreamingTextDeltas:
         assert ends[1]["committed"] is True   # final turn
 
 
+class TestSystemRefuseToolDescription:
+    """v0.9.2 close-out: the build_agent_tools-generated system_refuse
+    tool description must match conversation-mode semantics — i.e.,
+    it must NOT instruct the agent to call the legacy `set_output`
+    sentinel after refusing (set_output doesn't exist on the
+    conversation-mode tool surface). The agent reads this string
+    and acts on it; a stale instruction means the agent calls
+    refuse + tries to call set_output (which 404s as an unknown
+    tool) + keeps generating text. JL caught this in manual
+    testing 2026-05-04 evening when the agent reasoned 'I should
+    call set_output to terminate the loop' after refusing."""
+
+    def test_description_does_not_mention_set_output(self):
+        from termin_server.ai_provider import build_agent_tools
+        tools = build_agent_tools(["chat_threads"], {})
+        refuse = next(
+            (t for t in tools if t.get("name") == "system_refuse"),
+            None,
+        )
+        assert refuse is not None, (
+            "system_refuse must always be in the agent tool surface"
+        )
+        desc = refuse.get("description", "")
+        assert "set_output" not in desc.lower(), (
+            f"system_refuse description must not reference the "
+            f"legacy set_output sentinel (doesn't exist in "
+            f"conversation mode). Got:\n{desc}"
+        )
+
+    def test_description_directs_agent_to_stop_generating(self):
+        """The description must tell the agent that calling
+        system_refuse terminates its response — no further text
+        or tool calls."""
+        from termin_server.ai_provider import build_agent_tools
+        tools = build_agent_tools(["chat_threads"], {})
+        refuse = next(
+            (t for t in tools if t.get("name") == "system_refuse"),
+            None,
+        )
+        desc = (refuse.get("description") or "").lower()
+        # One of these phrasings must appear; the exact wording can
+        # evolve but the directive must be unmistakable.
+        keywords = (
+            "do not generate", "no further", "no additional",
+            "terminate", "stop", "end your response",
+        )
+        assert any(k in desc for k in keywords), (
+            f"system_refuse description must direct the agent to "
+            f"stop generating after the call. Got:\n{refuse.get('description')}"
+        )
+
+
+class TestRuntimeSuppressesTextDeltasAfterRefusal:
+    """v0.9.2 close-out: defense-in-depth for the refusal halt
+    contract. The provider's mid-turn text stream may already be
+    yielding deltas when a tool_use block for system_refuse arrives
+    in the same response. The runtime's _on_text_delta callback
+    must suppress further publication on the streaming channel
+    once refusal_state is set so the chat UI's pending bubble
+    doesn't accumulate post-refusal text. This is the runtime-side
+    enforcement; the provider-side optimization (break out of the
+    Anthropic stream context manager early) is a separate
+    cost-saving measure tested via TestProviderBreaksOnRefuse."""
+
+    def test_text_deltas_after_refusal_are_not_published(self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        captured_events = []
+
+        class _RefuseMidStreamLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                # Stream pre-refusal text — should publish.
+                if on_text_delta:
+                    await on_text_delta("Let me think...")
+                # Fire system_refuse mid-turn.
+                await execute_tool(
+                    "system_refuse",
+                    {"reason": "policy: cannot continue"},
+                )
+                # A misbehaving provider might continue to fire
+                # text deltas after the refuse tool returns. The
+                # runtime must suppress these.
+                if on_text_delta:
+                    await on_text_delta(" but actually I'll just keep talking")
+                if on_text_end:
+                    await on_text_end(committed=False)
+                return {"thinking": "", "summary": "halted"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_RefuseMidStreamLegacy()),
+            }
+
+            original_publish = ctx.event_bus.publish
+            async def _capture_publish(event):
+                captured_events.append(event)
+                await original_publish(event)
+            ctx.event_bus.publish = _capture_publish
+
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "suppress"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "trigger refuse"})
+            time.sleep(0.6)
+
+        stream_channel = (
+            "content.chat_threads.conversation.streaming"
+        )
+        delta_events = [
+            e for e in captured_events
+            if e.get("channel_id") == stream_channel
+            and e.get("type") == "delta"
+        ]
+        delta_texts = [e.get("text", "") for e in delta_events]
+        # Pre-refusal "Let me think..." DOES publish.
+        assert "Let me think..." in delta_texts, delta_texts
+        # Post-refusal " but actually..." MUST NOT publish.
+        for txt in delta_texts:
+            assert "actually I'll just keep talking" not in txt, (
+                f"post-refusal delta leaked through to streaming "
+                f"channel: {delta_texts!r}"
+            )
+
+
+class TestProviderBreaksOnRefuse:
+    """v0.9.2 close-out: provider-side optimization. When the
+    Anthropic stream's content_block_start fires for a tool_use
+    block named system_refuse, the producer should stop forwarding
+    further text_delta events to the consumer. This complements
+    the runtime-side _on_text_delta suppression
+    (TestRuntimeSuppressesTextDeltasAfterRefusal) but acts at the
+    provider boundary so the bridge queue isn't burdened with
+    deltas that will be discarded.
+
+    Tests the producer logic directly via a mock-shaped Anthropic
+    stream that yields scripted events.
+    """
+
+    def test_text_deltas_after_system_refuse_block_are_dropped(self):
+        from termin_server.ai_provider import (
+            _producer_for_conversation_stream,
+        )
+
+        # Scripted event stream: text_delta, content_block_start
+        # for tool_use system_refuse, text_delta (post-refuse).
+        class _Event:
+            def __init__(self, type, **kw):
+                self.type = type
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        class _Delta:
+            def __init__(self, type, text=""):
+                self.type = type
+                self.text = text
+
+        class _ContentBlock:
+            def __init__(self, type, name=None):
+                self.type = type
+                self.name = name
+
+        events = [
+            _Event("content_block_delta",
+                   delta=_Delta("text_delta", text="Pre-refuse text. ")),
+            _Event("content_block_start",
+                   content_block=_ContentBlock("tool_use",
+                                               name="system_refuse")),
+            _Event("content_block_delta",
+                   delta=_Delta("text_delta",
+                                text="Post-refuse text — drop me.")),
+        ]
+        emitted: list = []
+        def put(item):
+            emitted.append(item)
+        _producer_for_conversation_stream(events, put)
+        delta_texts = [
+            i.get("text", "") for i in emitted
+            if i.get("type") == "text_delta"
+        ]
+        assert "Pre-refuse text. " in delta_texts, delta_texts
+        for t in delta_texts:
+            assert "Post-refuse text" not in t, (
+                f"producer must drop text_deltas after system_refuse "
+                f"content_block_start; emitted: {delta_texts!r}"
+            )
+
+
 class TestRefusalTerminatesLoop:
     """v0.9.2 close-out: per compute-contract.md §6.1, system_refuse
     must terminate the agent loop. The runtime supplies should_halt
