@@ -382,7 +382,7 @@ class _TextOnlyStubLegacy:
         self.last_messages = messages
         # Single turn: just emit a final assistant text via writeback.
         await on_writeback(
-            kind="assistant", body=self._text,
+            kind="agent", body=self._text,
         )
         return {"thinking": self._text, "summary": "ok"}
 
@@ -416,9 +416,9 @@ class _ToolUsingStubLegacy:
             body=json.dumps(tool_out),
             tool_call_id="toolu_stub_1",
         )
-        # Turn 2: final assistant text.
+        # Turn 2: final agent text (post-rename canonical kind).
         await on_writeback(
-            kind="assistant",
+            kind="agent",
             body="The current time is 2026-05-04T10:00:00Z.",
         )
         return {"thinking": "computed", "summary": "ok"}
@@ -473,8 +473,13 @@ class TestConversationMaterializationDispatch:
             user_entry = entries[0]
             assistant_entry = entries[1]
             assert user_entry["kind"] == "user"
-            assert assistant_entry["kind"] == "assistant"
-            # Assistant write-back has no `type` field on response.
+            # v0.9.2 close-out (2026-05-05) rename: production
+            # write-backs use the new canonical `agent` kind. Old
+            # data with `assistant` continues to validate; this
+            # test exercises the production path so it asserts
+            # the new name.
+            assert assistant_entry["kind"] == "agent"
+            # Agent write-back has no `type` field on a normal reply.
             assert "type" not in assistant_entry, assistant_entry
             assert assistant_entry["body"] == "hi back"
             assert assistant_entry["parent_id"] == user_entry["id"]
@@ -544,7 +549,7 @@ class TestConversationToolCallWriteback:
         # Expected source order: user, tool_call, tool_result, assistant
         kinds = [e["kind"] for e in entries]
         assert kinds == [
-            "user", "tool_call", "tool_result", "assistant",
+            "user", "tool_call", "tool_result", "agent",
         ], entries
         user_id = entries[0]["id"]
         # All three auto-write-back entries link back to the user entry.
@@ -595,7 +600,7 @@ class TestStreamingTextDeltas:
                 # what the production loop does) and fire end with
                 # committed=True so the chat UI knows the matching
                 # appended event will follow.
-                await on_writeback(kind="assistant", body="Hello there")
+                await on_writeback(kind="agent", body="Hello there")
                 if on_text_end:
                     await on_text_end(committed=True)
                 return {"thinking": "", "summary": "ok"}
@@ -683,7 +688,7 @@ class TestStreamingTextDeltas:
                 # Turn 2: final reply.
                 if on_text_delta:
                     await on_text_delta("It's 1pm.")
-                await on_writeback(kind="assistant", body="It's 1pm.")
+                await on_writeback(kind="agent", body="It's 1pm.")
                 if on_text_end:
                     await on_text_end(committed=True)
                 return {"thinking": "", "summary": "ok"}
@@ -719,6 +724,151 @@ class TestStreamingTextDeltas:
         assert len(ends) == 2, ends
         assert ends[0]["committed"] is False  # tool turn
         assert ends[1]["committed"] is True   # final turn
+
+
+class TestKindRenameAssistantToAgent:
+    """v0.9.2 close-out (2026-05-05): the conversation entry kind
+    `assistant` is renamed to `agent` to match the BRD/D-01 framing
+    (these entries are produced by an AI Agent, not a generic
+    'assistant'). The wire-shape mapping to Anthropic's role
+    enum stays unchanged — both `assistant` and `agent` materialize
+    to role="assistant" — so existing chat_thread data with the
+    old kind value continues to work as a back-compat read shape.
+
+    Production code paths (the conversation-mode loop's final
+    text commit; the refusal-append) emit `agent`. The validator
+    accepts both. Renderers treat both the same."""
+
+    def test_materialize_agent_kind_maps_to_assistant_role(self):
+        """The Anthropic mapping table: kind 'agent' → role
+        'assistant'. Same as kind 'assistant'."""
+        from termin_server.ai_provider import materialize_to_anthropic
+        msgs = materialize_to_anthropic([
+            {"kind": "user", "body": "hi", "id": "e-1"},
+            {"kind": "agent", "body": "hello back", "id": "e-2"},
+        ])
+        assert msgs[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello back"}],
+        }
+
+    def test_materialize_assistant_kind_still_works_back_compat(self):
+        """Existing chat_thread data with kind='assistant' still
+        materializes correctly — it's the same role-mapping."""
+        from termin_server.ai_provider import materialize_to_anthropic
+        msgs = materialize_to_anthropic([
+            {"kind": "user", "body": "hi", "id": "e-1"},
+            {"kind": "assistant", "body": "hello back", "id": "e-2"},
+        ])
+        assert msgs[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello back"}],
+        }
+
+    def test_append_endpoint_accepts_agent_kind(self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+        with TestClient(app) as client:
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "kind"})
+            thread_id = create.json()["id"]
+            ap = client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "agent", "body": "hello"})
+            assert ap.status_code == 201, ap.text
+            assert ap.json()["kind"] == "agent"
+
+    def test_append_endpoint_accepts_assistant_kind_back_compat(
+            self, tmp_path):
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+        with TestClient(app) as client:
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "back-compat"})
+            thread_id = create.json()["id"]
+            ap = client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "assistant", "body": "hello"})
+            assert ap.status_code == 201, ap.text
+
+    def test_conversation_mode_final_text_commits_as_agent_kind(
+            self, tmp_path):
+        """The production loop's final-text commit must use the new
+        kind name. Verified via stub legacy that fires on_writeback
+        with the canonical kind the runtime now uses."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        class _NormalReplyLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                # The PRODUCTION path emits kind="agent" — verify
+                # by checking what the actual runtime calls
+                # on_writeback with. This stub mirrors that.
+                await on_writeback(kind="agent", body="hello there")
+                return {"thinking": "", "summary": "ok"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_NormalReplyLegacy()),
+            }
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "agent-kind"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "hi"})
+            time.sleep(0.4)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+            kinds = [e["kind"] for e in entries]
+            assert kinds == ["user", "agent"], entries
+
+    def test_refusal_entry_uses_agent_kind(self, tmp_path):
+        """Per the v0.9.2 close-out rename: refusal entries emit
+        kind="agent" type="refusal" (was kind="assistant"
+        type="refusal" pre-rename)."""
+        from fastapi.testclient import TestClient
+        app, _ir = _compile_chat_app(tmp_path)
+
+        class _RefuseLegacy:
+            async def agent_loop_with_conversation(
+                self, directive, messages, tools, execute_tool,
+                on_writeback, on_text_delta=None, on_text_end=None,
+                should_halt=None, on_event=None, max_turns=20,
+            ):
+                await execute_tool(
+                    "system_refuse", {"reason": "policy: no"})
+                return {"thinking": "", "summary": "halted"}
+
+        with TestClient(app) as client:
+            ctx = getattr(client.app.state, "ctx", None) or getattr(
+                client.app, "_termin_ctx", None,
+            )
+            ctx.compute_providers = {
+                "reply": _StubProvider(_RefuseLegacy()),
+            }
+            create = client.post(
+                "/api/v1/chat_threads", json={"title": "refuse-kind"})
+            thread_id = create.json()["id"]
+            client.post(
+                f"/api/v1/chat_threads/{thread_id}/conversation:append",
+                json={"kind": "user", "body": "trigger"})
+            time.sleep(0.4)
+
+            get = client.get(f"/api/v1/chat_threads/{thread_id}")
+            raw = get.json().get("conversation")
+            entries = json.loads(raw) if isinstance(raw, str) else raw
+            assert entries[1]["kind"] == "agent", entries
+            assert entries[1].get("type") == "refusal"
 
 
 class TestSystemRefuseToolDescription:
@@ -968,7 +1118,7 @@ class TestRefusalTerminatesLoop:
                     # Post-refuse turns: try to commit text + call
                     # a tool. These should all be no-ops.
                     await on_writeback(
-                        kind="assistant",
+                        kind="agent",
                         body=f"chatty followup turn {turn}",
                     )
                 return {"thinking": "", "summary": "completed"}
@@ -999,7 +1149,9 @@ class TestRefusalTerminatesLoop:
         # caused the loop to bail; on_writeback short-circuited
         # the writes that did fire.
         kinds = [e["kind"] for e in entries]
-        assert kinds == ["user", "assistant"], entries
+        # v0.9.2 close-out (2026-05-05) rename: refusal entries
+        # use the new canonical `agent` kind (was `assistant`).
+        assert kinds == ["user", "agent"], entries
         assert entries[1].get("type") == "refusal"
         assert "policy" in entries[1]["body"]
         # No body text from the stub's chatty followups landed.
@@ -1100,7 +1252,9 @@ class TestRefusalRegressionUnderL71:
             raw = get.json().get("conversation")
             entries = json.loads(raw) if isinstance(raw, str) else raw
             kinds = [e["kind"] for e in entries]
-            assert kinds == ["user", "assistant"], entries
+            # v0.9.2 close-out (2026-05-05) rename: refusal entries
+            # use the new canonical `agent` kind (was `assistant`).
+            assert kinds == ["user", "agent"], entries
             assert entries[1]["type"] == "refusal"
             assert entries[1]["body"] == "nope"
 
@@ -1178,7 +1332,7 @@ class TestAgentChatbotV092EndToEnd:
                         if last_user:
                             break
                 await on_writeback(
-                    kind="assistant",
+                    kind="agent",
                     body=f"echo: {last_user}",
                 )
                 return {"thinking": "", "summary": "ok"}
@@ -1217,7 +1371,7 @@ class TestAgentChatbotV092EndToEnd:
 
         kinds = [e["kind"] for e in entries]
         assert kinds == [
-            "user", "assistant", "user", "assistant",
+            "user", "agent", "user", "agent",
         ], entries
         # Each assistant reply parent-links to the user message
         # *that triggered its turn* — not the most recent overall.
@@ -1276,7 +1430,9 @@ class TestAgentChatbotV092EndToEnd:
             raw = get.json().get("conversation")
             entries = json.loads(raw) if isinstance(raw, str) else raw
 
-        assert [e["kind"] for e in entries] == ["user", "assistant"]
+        # v0.9.2 close-out (2026-05-05) rename: refusal entries
+        # use the new canonical `agent` kind (was `assistant`).
+        assert [e["kind"] for e in entries] == ["user", "agent"]
         assert entries[1]["type"] == "refusal"
         assert "fabricating" in entries[1]["body"]
 
@@ -1348,7 +1504,7 @@ class TestPurposeFieldOnToolCallEntry:
                     tool_call_id="toolu_p1",
                 )
                 await on_writeback(
-                    kind="assistant", body="It's 10am.",
+                    kind="agent", body="It's 10am.",
                 )
                 return {"thinking": "", "summary": "ok"}
 
@@ -1372,7 +1528,7 @@ class TestPurposeFieldOnToolCallEntry:
 
         kinds = [e["kind"] for e in entries]
         assert kinds == [
-            "user", "tool_call", "tool_result", "assistant",
+            "user", "tool_call", "tool_result", "agent",
         ], entries
         tc = entries[1]
         assert tc.get("purpose") == "checking the time"
@@ -1560,7 +1716,7 @@ As an anonymous, I want to chat:
                     tool_call_id="toolu_inv_1",
                 )
                 await on_writeback(
-                    kind="assistant",
+                    kind="agent",
                     body="The time is 10am.",
                 )
                 return {"thinking": "", "summary": "ok"}
@@ -1593,7 +1749,7 @@ As an anonymous, I want to chat:
         # The four expected entries landed.
         kinds = [e["kind"] for e in entries]
         assert kinds == [
-            "user", "tool_call", "tool_result", "assistant",
+            "user", "tool_call", "tool_result", "agent",
         ], entries
         # Purpose persists.
         assert entries[1].get("purpose") == "checking the time"

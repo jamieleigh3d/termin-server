@@ -60,7 +60,11 @@ class ConversationMaterializationError(Exception):
 # ConversationMaterializationError.
 
 _KINDS_USER_ROLE = frozenset({"user", "tool_result", "system_event"})
-_KINDS_ASSISTANT_ROLE = frozenset({"assistant", "tool_call"})
+# v0.9.2 close-out (2026-05-05): both the new canonical `agent` kind
+# and the legacy `assistant` kind map to Anthropic's role="assistant".
+# Storage keeps whatever kind the caller wrote; only the wire shape
+# to the provider is normalized.
+_KINDS_ASSISTANT_ROLE = frozenset({"agent", "assistant", "tool_call"})
 
 
 # ── v0.9.2 close-out: `purpose` field on tool_call entries ──
@@ -1405,12 +1409,18 @@ class AIProvider:
 
             if not tool_calls:
                 # End-of-turn: commit the streamed text as the
-                # assistant entry. Empty text yields no entry — the
+                # agent entry. Empty text yields no entry — the
                 # caller can decide whether that's an error.
+                # v0.9.2 close-out (2026-05-05): canonical kind is
+                # `agent` (was `assistant` pre-rename). Both still
+                # validate per routes._CANONICAL_KINDS and both
+                # materialize to Anthropic role="assistant"; new
+                # production writes use `agent` to match the
+                # BRD/D-01 framing.
                 final_text = accumulated_text.strip()
                 if final_text:
                     await on_writeback(
-                        kind="assistant", body=final_text,
+                        kind="agent", body=final_text,
                     )
                     if on_text_end:
                         await on_text_end(committed=True)

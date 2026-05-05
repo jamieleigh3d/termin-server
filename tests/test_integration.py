@@ -738,7 +738,12 @@ As anonymous, I want to chat so that I can see refusals:
             )
             assert entries[0]["kind"] == "user"
             assert entries[0]["body"] == "do something"
-            assert entries[1]["kind"] == "assistant"
+            # v0.9.2 close-out (2026-05-05) rename: refusal entries
+            # use the new canonical `agent` kind (was `assistant`).
+            # Both still validate per routes._CANONICAL_KINDS but new
+            # production writes (the runtime's refusal-append) emit
+            # `agent`.
+            assert entries[1]["kind"] == "agent"
             assert entries[1].get("type") == "refusal"
             assert entries[1]["body"] == "unsupported request"
             assert entries[1].get("parent_id") == entries[0]["id"]

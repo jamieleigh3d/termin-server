@@ -707,11 +707,11 @@ function hydrateConversationFieldChat(chat) {
     const bubble = document.createElement("div");
     bubble.className =
       "bg-gray-200 text-gray-800 rounded-lg px-4 py-2 max-w-[70%]";
-    bubble.setAttribute("aria-label", "Assistant message (streaming)");
+    bubble.setAttribute("aria-label", "AI Agent message (streaming)");
     bubble.setAttribute("aria-live", "polite");
     const label = document.createElement("div");
     label.className = "text-xs opacity-70 mb-1";
-    label.textContent = "Assistant";
+    label.textContent = "AI Agent";
     const body = document.createElement("div");
     body.setAttribute("data-termin-chat-pending-body", "");
     bubble.appendChild(label);
@@ -1118,7 +1118,23 @@ function _renderEntryUser(wrapper, entry) {
   wrapper.appendChild(bubble);
 }
 
-function _renderEntryAssistant(wrapper, entry) {
+// v0.9.2 close-out (2026-05-05): the renderer for the AI Agent's
+// entries. Handles both `kind: "agent"` (new canonical) and
+// `kind: "assistant"` (back-compat from pre-rename data) — the
+// CONVERSATION_ENTRY_RENDERERS dispatch table maps both names to
+// this function. The label says "AI Agent" rather than "Assistant"
+// so the user clearly sees the entity branding (per JL's point
+// that the chat surface shouldn't perpetuate the generic
+// "Assistant" framing — these entries come from a declared AI
+// Agent with a tool surface, not a generic chatbot persona).
+//
+// Refusal entries (`type === "refusal"`) get an amber bubble +
+// warning glyph + "AI Agent refused" label. The heading is two
+// lines so the entity attribution ("AI Agent") and the action
+// ("refused") are both visible — JL's earlier feedback was that
+// the bare "Refused" badge read as a system error rather than
+// the AI Agent's deliberate action.
+function _renderEntryAgent(wrapper, entry) {
   wrapper.className = "flex justify-start";
   const isRefusal = entry.type === "refusal";
   const bubble = document.createElement("div");
@@ -1126,22 +1142,24 @@ function _renderEntryAssistant(wrapper, entry) {
     ? "bg-amber-50 border border-amber-300 text-amber-900 rounded-lg px-4 py-2 max-w-[70%]"
     : "bg-gray-200 text-gray-800 rounded-lg px-4 py-2 max-w-[70%]";
   bubble.setAttribute("aria-label",
-    isRefusal ? "Assistant refusal" : "Assistant message");
+    isRefusal ? "AI Agent refused" : "AI Agent message");
   const label = document.createElement("div");
   label.className = "text-xs opacity-70 mb-1 flex items-center gap-1";
   if (isRefusal) {
-    // Color is one signal; the explicit "Refused" label + warning glyph
-    // + amber-bordered bubble shape together convey the distinction
-    // without depending on color perception.
+    // Color is one signal; the explicit "AI Agent refused" label
+    // + warning glyph + amber-bordered bubble shape together convey
+    // the distinction without depending on color perception. Two-
+    // line attribution ensures the user reads this as a deliberate
+    // refusal by the AI Agent, not a system error.
     const icon = document.createElement("span");
     icon.setAttribute("aria-hidden", "true");
     icon.textContent = "⚠";
     label.appendChild(icon);
     const txt = document.createElement("span");
-    txt.textContent = "Refused";
+    txt.textContent = "AI Agent refused";
     label.appendChild(txt);
   } else {
-    label.textContent = "Assistant";
+    label.textContent = "AI Agent";
   }
   const body = document.createElement("div");
   body.textContent = entry.body || "";
@@ -1150,6 +1168,10 @@ function _renderEntryAssistant(wrapper, entry) {
   _renderAttachments(bubble, entry.attachments);
   wrapper.appendChild(bubble);
 }
+
+// Back-compat alias for the function name used pre-rename. Some
+// callers may still grab it by the old name.
+const _renderEntryAssistant = _renderEntryAgent;
 
 function _renderEntryToolCall(wrapper, entry, pairedResult) {
   wrapper.className = "flex justify-start";
@@ -1243,9 +1265,14 @@ function _renderEntryUnknown(wrapper, entry) {
   wrapper.appendChild(bubble);
 }
 
+// v0.9.2 close-out (2026-05-05) rename: `agent` is the canonical
+// kind for entries produced by the AI Agent; `assistant` stays as
+// a back-compat alias so existing chat_thread data still renders.
+// Both dispatch to the same renderer.
 const CONVERSATION_ENTRY_RENDERERS = {
   user: _renderEntryUser,
-  assistant: _renderEntryAssistant,
+  agent: _renderEntryAgent,
+  assistant: _renderEntryAgent,
   tool_call: _renderEntryToolCall,
   tool_result: _renderEntryToolResult,
   system_event: _renderEntrySystemEvent,

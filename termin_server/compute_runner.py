@@ -1164,8 +1164,13 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 parent_id = None
                 if triggering_entry:
                     parent_id = triggering_entry.get("id")
+                # v0.9.2 close-out (2026-05-05): refusal entry uses
+                # the new canonical `agent` kind. Both `agent` and
+                # `assistant` validate; both materialize to
+                # Anthropic role="assistant"; renderers treat them
+                # the same. New production writes prefer `agent`.
                 refusal_payload = {
-                    "kind": "assistant",
+                    "kind": "agent",
                     "type": "refusal",
                     "body": refusal_state["reason"],
                 }

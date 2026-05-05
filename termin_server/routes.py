@@ -470,8 +470,19 @@ def _uuid7_str() -> str:
 # v0.9.2 L3: canonical conversation entry kinds (per tech-design §7.2).
 # Validated at append time so storage never holds entries the runtime
 # doesn't recognize.
+#
+# v0.9.2 close-out (2026-05-05): the canonical AI-side entry kind is
+# renamed from `assistant` to `agent` to match the BRD/D-01 framing
+# (these entries come from an AI Agent — see Tenet 5: declared agents
+# over ambient agents). The wire-shape mapping to Anthropic's role
+# enum is unchanged (`materialize_to_anthropic` maps both `agent` and
+# `assistant` to role="assistant"), so existing chat_thread data with
+# the old kind value continues to work as a back-compat read shape.
+# `assistant` stays in the validator for that read-back purpose;
+# new appends from production code use `agent`.
 _CANONICAL_KINDS = frozenset({
-    "user", "assistant", "tool_call", "tool_result", "system_event",
+    "user", "agent", "assistant", "tool_call", "tool_result",
+    "system_event",
 })
 
 
