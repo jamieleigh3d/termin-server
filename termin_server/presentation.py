@@ -747,12 +747,17 @@ def _render_chat_conversation(node: dict) -> str:
         f'Loading conversation...</div>',
         f'  </div>',
         f'  <div class="border-t p-3" data-termin-chat-input>',
-        # No <form action=...>: the L4 WS append frame is the send path.
-        # The submit handler intercepts and routes via Termin.appendTo().
-        # Fallback: if JS is disabled, the form is a no-op (the data-termin
-        # attributes carry everything, and the hydrator owns all writes).
+        # The L4 WS append frame is the send path. The hydrator's
+        # submit listener intercepts and routes via sendAppendFrame().
+        # Defensive: action="javascript:void(0)" + onsubmit="return false"
+        # ensure the form is a no-op on default submit if the user
+        # hits Enter / Send during the bootstrap window before the
+        # JS hydrator has bound its listener (without these the form
+        # would POST to the page URL — 405 Method Not Allowed). The
+        # data-termin attributes carry everything; the hydrator owns
+        # all writes.
         f'    <form class="flex space-x-2" data-termin-chat-form'
-        f' onsubmit="return false">',
+        f' action="javascript:void(0)" onsubmit="return false">',
         f'      <input type="text" name="body" placeholder="Type a message..."'
         f' aria-label="Message text"'
         f' class="flex-1 border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"'

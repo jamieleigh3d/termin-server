@@ -1081,6 +1081,15 @@ class TestChatConversationFieldRender:
         assert 'data-termin-chat-input' in html
         assert 'data-termin-chat-form' in html
         assert 'action="/api/v1/' not in html
+        # Defensive form-submit no-op: the form must NOT default-submit
+        # to the page URL during the bootstrap window before the JS
+        # hydrator has bound its submit listener. Both the inline
+        # onsubmit="return false" AND the action="javascript:void(0)"
+        # are required — without them the form POSTs to the page URL
+        # on Enter / Send and the user sees a "Method Not Allowed"
+        # browser alert (regression observed 2026-05-04 evening).
+        assert 'onsubmit="return false"' in html
+        assert 'action="javascript:void(0)"' in html
 
     def test_render_chat_conversation_messages_container_present(self):
         """The hydrator targets `[data-termin-chat-messages]` for entry
