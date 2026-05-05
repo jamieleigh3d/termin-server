@@ -21,10 +21,77 @@ Two surfaces under test:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 import pytest
+
+
+# ── v0.9.2 close-out: aiosqlite event-loop-closed mitigation ──
+#
+# JL hit "Event loop is closed" tracebacks during ~2h of idle time
+# in a live `termin serve` session. Root cause: each compute fired
+# from a `<X>.<Y>.appended` event runs in its own background
+# thread with a freshly-created asyncio loop (per app.py
+# `_run_compute`). The compute opens an aiosqlite connection
+# (which spawns a worker thread that keeps a reference to the
+# loop), does its work, closes the connection. But aiosqlite's
+# worker can have a lingering `call_soon_threadsafe` callback
+# scheduled (the worker's own cleanup) when the bg loop closes —
+# the callback fires after close() and raises "Event loop is
+# closed".
+#
+# Fix: drain pending tasks + shutdown_asyncgens before close so
+# in-flight callbacks resolve cleanly. The helper handles the
+# common cases and never raises (best-effort drain).
+
+
+class TestBgLoopCleanShutdown:
+    def test_close_bg_loop_cleanly_drains_pending_tasks(self):
+        """A pending fire-and-forget task on the loop must not
+        cause `bg_loop.close()` to raise (the task is cancelled
+        + drained first)."""
+        from termin_server.app import _close_bg_loop_cleanly
+
+        loop = asyncio.new_event_loop()
+
+        async def _spawn_orphan():
+            async def _orphan():
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    pass
+            # Fire-and-forget on the active loop.
+            asyncio.ensure_future(_orphan())
+
+        loop.run_until_complete(_spawn_orphan())
+        # Sanity check: the orphan is still pending.
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        assert len(pending) >= 1, pending
+
+        # The helper must not raise.
+        _close_bg_loop_cleanly(loop)
+        assert loop.is_closed()
+
+    def test_close_bg_loop_cleanly_handles_already_closed(self):
+        """Idempotent: calling on an already-closed loop does
+        not raise."""
+        from termin_server.app import _close_bg_loop_cleanly
+
+        loop = asyncio.new_event_loop()
+        loop.close()
+        # No-op on a closed loop.
+        _close_bg_loop_cleanly(loop)
+        assert loop.is_closed()
+
+    def test_close_bg_loop_cleanly_handles_empty(self):
+        """A fresh loop with no tasks closes cleanly."""
+        from termin_server.app import _close_bg_loop_cleanly
+
+        loop = asyncio.new_event_loop()
+        _close_bg_loop_cleanly(loop)
+        assert loop.is_closed()
 
 
 # ── L7.2: materialize_to_anthropic — pure mapping helper ──

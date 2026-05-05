@@ -62,6 +62,55 @@ import re
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+def _close_bg_loop_cleanly(loop) -> None:
+    """v0.9.2 close-out: drain pending tasks before closing a
+    background asyncio loop so aiosqlite worker threads with
+    lingering ``call_soon_threadsafe`` callbacks don't raise
+    "Event loop is closed" tracebacks at idle (the symptom JL hit
+    after ~2h of a live ``termin serve`` session).
+
+    The race: each ``<X>.<Y>.appended`` event spawns a thread with
+    a fresh asyncio loop running ``execute_compute`` to completion.
+    If aiosqlite's worker has any callback already scheduled on
+    the loop when ``run_until_complete`` returns,
+    ``loop.close()`` cuts the worker off mid-callback — the next
+    ``call_soon_threadsafe`` raises.
+
+    Mitigation: cancel any pending tasks, await them (collecting
+    cancellation exceptions, ignoring them), shut down async
+    generators, then close. Best-effort — never raises; on a
+    closed loop it's a no-op.
+    """
+    import asyncio as _aio
+    if loop is None:
+        return
+    if loop.is_closed():
+        return
+    try:
+        try:
+            pending = [t for t in _aio.all_tasks(loop) if not t.done()]
+        except RuntimeError:
+            pending = []
+        if pending:
+            for task in pending:
+                task.cancel()
+            try:
+                loop.run_until_complete(
+                    _aio.gather(*pending, return_exceptions=True)
+                )
+            except Exception:
+                pass
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
 def _interpolate_env_vars(value):
     """Recursively replace ${VAR} placeholders with env var values.
 
@@ -1017,7 +1066,13 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                         except Exception as e:
                             print(f"[Termin] [ERROR] Compute '{_comp['name']['display']}' failed: {e}")
                         finally:
-                            bg_loop.close()
+                            # v0.9.2 close-out: drain pending tasks
+                            # before close so aiosqlite worker
+                            # threads with lingering
+                            # call_soon_threadsafe callbacks don't
+                            # raise "Event loop is closed" tracebacks
+                            # in long-running serve sessions.
+                            _close_bg_loop_cleanly(bg_loop)
                     threading.Thread(target=_run_compute, daemon=True).start()
 
     ctx.run_event_handlers = run_event_handlers
