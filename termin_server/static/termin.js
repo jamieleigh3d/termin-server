@@ -623,25 +623,62 @@ function hydrateConversationFieldChat(chat) {
   // set `data-termin-record-id` on the chat root before hydration.
   let recordId = chat.dataset.terminRecordId || null;
 
-  // Initial render: load the parent record (creating one if none
-  // exists), walk its conversation list, render entries.
-  resolveActiveRecord(source, recordId).then((rec) => {
-    if (!rec) {
+  // loadActiveThread: render the conversation for `recordId` into the
+  // messages container. Used both on initial mount and when the user
+  // switches threads via the picker (issue 3b). Idempotent: clears
+  // existing entries before rendering.
+  const labelEl = chat.querySelector("[data-termin-chat-thread-label]");
+  function _setThreadLabel(text) {
+    if (labelEl) labelEl.textContent = text;
+  }
+  function loadActiveThread() {
+    messagesContainer.innerHTML = "";
+    if (recordId == null) {
+      _setThreadLabel("New conversation");
       renderChatPlaceholder(messagesContainer,
         "No conversation yet. Send a message to start.");
       return;
     }
-    recordId = rec.id;
-    chat.dataset.terminRecordId = String(recordId);
-    const placeholder = messagesContainer.querySelector(
-      "[data-termin-chat-placeholder]");
-    if (placeholder) placeholder.remove();
-    const entries = Array.isArray(rec[field]) ? rec[field] : [];
-    renderConversationEntries(messagesContainer, entries);
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-  }).catch((err) => {
-    renderChatPlaceholder(messagesContainer,
-      "Could not load conversation: " + (err && err.message || err));
+    fetch(`/api/v1/${source}/${encodeURIComponent(recordId)}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((rec) => {
+        if (!rec) {
+          _setThreadLabel("Conversation");
+          renderChatPlaceholder(messagesContainer,
+            "Could not load thread.");
+          return;
+        }
+        // The label prefers a `title` field when the parent record
+        // declares one (the canonical chat_threads shape does);
+        // otherwise falls back to a short id-derived label.
+        _setThreadLabel(
+          (rec.title && String(rec.title)) ||
+          `Thread ${String(rec.id).slice(0, 8)}`,
+        );
+        const entries = _coerceEntries(rec[field]);
+        if (entries.length === 0) {
+          renderChatPlaceholder(messagesContainer,
+            "No messages yet. Send one to start.");
+          return;
+        }
+        renderConversationEntries(messagesContainer, entries);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      })
+      .catch((err) => {
+        renderChatPlaceholder(messagesContainer,
+          "Could not load conversation: " + (err && err.message || err));
+      });
+  }
+
+  // Initial render: pick an active record (if one exists), or leave
+  // recordId null and let the user start a new conversation by typing.
+  // The picker (issue 3) gives the user explicit control.
+  resolveActiveRecord(source, recordId).then((rec) => {
+    if (rec) {
+      recordId = rec.id;
+      chat.dataset.terminRecordId = String(recordId);
+    }
+    loadActiveThread();
   });
 
   // Subscribe to the field-specific appended event (L5).
@@ -660,9 +697,67 @@ function hydrateConversationFieldChat(chat) {
     const placeholder = messagesContainer.querySelector(
       "[data-termin-chat-placeholder]");
     if (placeholder) placeholder.remove();
-    appendConversationEntry(messagesContainer, data.appended_entry, /*isLive*/true);
+    // Issue 1 fix: when a tool_result arrives via live push, look up
+    // the matching tool_call's DOM node by tool_call_id and append
+    // the result inline under it. Mirrors what
+    // renderConversationEntries does for the initial load. Without
+    // this, live tool_results render standalone with the orphan
+    // label even when the tool_call is right above them.
+    const entry = data.appended_entry;
+    if (entry.kind === "tool_result" && entry.tool_call_id) {
+      const callWrapper = messagesContainer.querySelector(
+        `[data-termin-chat-entry][data-termin-kind="tool_call"]` +
+        `[data-termin-tool-call-id="${cssEscape(entry.tool_call_id)}"]`,
+      );
+      if (callWrapper) {
+        _attachToolResultToCall(callWrapper, entry);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        return;
+      }
+    }
+    appendConversationEntry(messagesContainer, entry, /*isLive*/true);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
   });
+
+  // Expose the switch-thread API on the chat element so the picker
+  // (issue 3b — clickable thread rows + New chat button) can drive
+  // it. Also exposes the helper for any future provider-specific
+  // surface that wants to swap the active thread programmatically.
+  chat._terminSwitchThread = function(newRecordId) {
+    recordId = newRecordId;
+    if (newRecordId == null) {
+      delete chat.dataset.terminRecordId;
+    } else {
+      chat.dataset.terminRecordId = String(newRecordId);
+    }
+    loadActiveThread();
+    _refreshThreadPickerHighlight(source, newRecordId);
+  };
+
+  // Issue 3a: wire the "+ New chat" button. Creates a fresh parent
+  // record (POST /api/v1/<source>) and switches the chat to it.
+  // Aria-aware: keyboard activation works because the element is a
+  // real <button>.
+  const newBtn = chat.querySelector("[data-termin-chat-new-thread]");
+  if (newBtn) {
+    newBtn.addEventListener("click", async () => {
+      try {
+        const rec = await ensureRecord(source);
+        chat._terminSwitchThread(rec.id);
+      } catch (err) {
+        console.warn("[Termin] Could not create new chat thread:", err);
+      }
+    });
+  }
+
+  // Issue 3b: register this chat as a switch-target for the thread
+  // picker. The picker (`hydrateThreadPickers`) walks
+  // `[data-termin-row-id]` cells inside any data_table whose source
+  // matches and binds click handlers that call _terminSwitchThread.
+  // Re-running the picker after the chat hydrator binds ensures the
+  // table rows are wired even if the chat hydrator runs first.
+  hydrateThreadPickersFor(source);
+  _refreshThreadPickerHighlight(source, recordId);
 
   // Wire the input form to the L4 WS append frame.
   const form = chat.querySelector("[data-termin-chat-form]");
@@ -701,6 +796,101 @@ function renderChatPlaceholder(container, text) {
     container.appendChild(placeholder);
   }
   placeholder.textContent = text;
+}
+
+// Issue 3b helpers (v0.9.2 close-out): clickable thread rows in
+// data_table components on the same page as a conversation-mode
+// chat. The page often shows both — `Display a table of <X>` for
+// the list, `Show a chat for <X>.<field>` for the active thread.
+// Without these helpers, the table is read-only and can't drive
+// the chat. With them, clicking a row switches the chat to that
+// thread (re-fetches + re-renders the conversation).
+//
+// Each chat exposes _terminSwitchThread(recordId) on its DOM node
+// (set by hydrateConversationFieldChat). The picker walks the
+// page's data_tables for matching content, finds rows by
+// `data-termin-row-id`, and wires click → switchThread.
+
+function hydrateThreadPickersFor(source) {
+  // Find every data_table whose content matches `source` (the
+  // data_table renderer stamps both `data-termin-component` and
+  // `data-termin-source` on the <table>). Each table gets ONE
+  // delegated click listener at the table level (not per-row), so
+  // rows added later via WS push (createRow) are wired
+  // automatically — no need to re-hydrate after each table mutation.
+  const tables = document.querySelectorAll(
+    `table[data-termin-component="data_table"]` +
+    `[data-termin-source="${cssEscape(source)}"]`,
+  );
+  const chats = document.querySelectorAll(
+    `[data-termin-chat][data-termin-source="${cssEscape(source)}"]`,
+  );
+  if (tables.length === 0 || chats.length === 0) return;
+
+  function dispatchSwitch(recordId) {
+    for (const chat of chats) {
+      if (typeof chat._terminSwitchThread === "function") {
+        chat._terminSwitchThread(recordId);
+      }
+    }
+  }
+
+  for (const table of tables) {
+    if (table._terminThreadPickerWired) continue;
+    table._terminThreadPickerWired = true;
+    // Visual + keyboard affordance for the existing rows. New rows
+    // added via WS push pick up these styles via the table-level
+    // CSS selector below; the click delegate works for them too.
+    const styleRows = () => {
+      table.querySelectorAll("tbody tr[data-termin-row-id]").forEach((row) => {
+        row.style.cursor = "pointer";
+        row.setAttribute("role", "button");
+        if (!row.hasAttribute("tabindex")) row.setAttribute("tabindex", "0");
+      });
+    };
+    styleRows();
+    table.addEventListener("click", (e) => {
+      const row = e.target.closest("tr[data-termin-row-id]");
+      if (!row || !table.contains(row)) return;
+      // Skip clicks on form controls inside cells (delete/edit
+      // buttons etc.) so the picker doesn't fight with them.
+      if (e.target.closest("button, a, input, select, textarea, form")) return;
+      dispatchSwitch(row.getAttribute("data-termin-row-id"));
+    });
+    table.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const row = e.target.closest("tr[data-termin-row-id]");
+      if (!row || !table.contains(row)) return;
+      e.preventDefault();
+      dispatchSwitch(row.getAttribute("data-termin-row-id"));
+    });
+    // Re-style rows on the next tick after WS-added rows might land,
+    // and once more on each created/updated push (cheap; no harm).
+    const restyle = () => styleRows();
+    subscribe(`content.${source}.created`, restyle);
+    subscribe(`content.${source}.updated`, restyle);
+  }
+}
+
+function _refreshThreadPickerHighlight(source, activeRecordId) {
+  const tables = document.querySelectorAll(
+    `table[data-termin-component="data_table"]` +
+    `[data-termin-source="${cssEscape(source)}"]`,
+  );
+  const activeStr = activeRecordId == null ? "" : String(activeRecordId);
+  for (const table of tables) {
+    const rows = table.querySelectorAll("[data-termin-row-id]");
+    for (const row of rows) {
+      const rid = row.getAttribute("data-termin-row-id");
+      if (rid === activeStr) {
+        row.setAttribute("data-termin-active-thread", "");
+        row.classList.add("bg-blue-50");
+      } else {
+        row.removeAttribute("data-termin-active-thread");
+        row.classList.remove("bg-blue-50");
+      }
+    }
+  }
 }
 
 async function resolveActiveRecord(source, pinnedId) {
@@ -779,12 +969,60 @@ function appendConversationEntry(container, entry, isLive, pairedResult) {
   if (type) wrapper.setAttribute("data-termin-type", type);
   if (entry.source) wrapper.setAttribute("data-termin-source", entry.source);
   if (entry.tool_name) wrapper.setAttribute("data-termin-tool-name", entry.tool_name);
+  // Issue 1 (v0.9.2 close-out): tag tool_call wrappers with their
+  // tool_call_id so the live-append subscriber can find them when a
+  // matching tool_result arrives later. Standalone (non-paired)
+  // tool_call render is the path live-arriving tool_calls take —
+  // their tool_result joins inline once it pushes through.
+  if (entry.tool_call_id) {
+    wrapper.setAttribute("data-termin-tool-call-id", entry.tool_call_id);
+  }
   if (entry.id) wrapper.setAttribute("data-termin-entry-id", entry.id);
   if (isLive) wrapper.classList.add("termin-fade-in");
 
   const renderer = CONVERSATION_ENTRY_RENDERERS[kind] || _renderEntryUnknown;
   renderer(wrapper, entry, pairedResult);
   container.appendChild(wrapper);
+}
+
+// Issue 1 fix helper: attach a tool_result entry's body inline under
+// its already-rendered tool_call DOM node. Mirrors the "Result:"
+// section _renderEntryToolCall draws when pairedResult is supplied
+// at initial-render time.
+function _attachToolResultToCall(callWrapper, resultEntry) {
+  if (!callWrapper || !resultEntry) return;
+  const details = callWrapper.querySelector("details");
+  if (!details) return;
+  // Idempotent: don't double-render if a result was already paired.
+  if (details.querySelector("[data-termin-tool-result-body]")) return;
+  const resultLabel = document.createElement("div");
+  resultLabel.className = "mt-2 text-xs uppercase tracking-wide opacity-60";
+  resultLabel.textContent = "Result";
+  details.appendChild(resultLabel);
+  const result = document.createElement("div");
+  result.className = "mt-1 text-xs whitespace-pre-wrap break-words";
+  result.setAttribute("data-termin-tool-result-body", "");
+  result.textContent = resultEntry.body || "";
+  details.appendChild(result);
+  // Auto-expand so the user sees the new result without clicking.
+  details.open = true;
+}
+
+// Issue 4 fix helper: the conversation field is JSON-array-shaped on
+// the server side, but the standard CRUD GET on a SQLite-backed
+// runtime returns the raw JSON string. Parse the string when we see
+// one; pass arrays through unchanged.
+function _coerceEntries(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && value.length > 0) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
 }
 
 // Per-kind renderers. Each fills `wrapper` with the entry's HTML.

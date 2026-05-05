@@ -1098,6 +1098,12 @@ class TestChatConversationFieldRender:
         #     URL).
         assert 'onsubmit="return false"' in html
         assert 'data-termin-no-default-submit' in html
+        # v0.9.2 close-out (issue 3a): the chat header carries a
+        # New-chat button + thread label. Hydrator wires the button
+        # to ensureRecord() + _terminSwitchThread(); the label
+        # updates with the active thread's title on each switch.
+        assert 'data-termin-chat-new-thread' in html
+        assert 'data-termin-chat-thread-label' in html
 
     def test_render_chat_conversation_messages_container_present(self):
         """The hydrator targets `[data-termin-chat-messages]` for entry

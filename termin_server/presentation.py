@@ -736,6 +736,22 @@ def _render_chat_conversation(node: dict) -> str:
         f' data-termin-source="{source}"'
         f' data-termin-conversation-field="{conv_field}"'
         f' data-termin-subscribe="content.{source}.{conv_field}.appended">',
+        # Issue 3a (v0.9.2 close-out): the chat header carries a
+        # "New chat" button. The hydrator wires it to create a fresh
+        # parent record (POST /api/v1/<source>) and switch the chat
+        # to that record (loadActiveThread). Without this, users
+        # have no way to start a new conversation — the hydrator
+        # auto-resumes the most-recent visible record, which is the
+        # right default for "open the chat where I left off" but
+        # leaves "start fresh" unreachable.
+        f'  <div class="flex items-center justify-between border-b px-3 py-2">',
+        f'    <div class="text-sm text-gray-700 font-medium"'
+        f' data-termin-chat-thread-label>Conversation</div>',
+        f'    <button type="button"'
+        f' class="text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1 rounded"'
+        f' data-termin-chat-new-thread'
+        f' aria-label="Start a new conversation">+ New chat</button>',
+        f'  </div>',
         f'  <div class="flex-1 overflow-y-auto p-4 space-y-3"'
         f' data-termin-chat-messages'
         f' aria-live="polite"'
