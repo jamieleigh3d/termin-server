@@ -23,8 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
-from ..contracts import Category, ContractRegistry
-from ..channel_contract import (
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.channel_contract import (
     ChannelAuditRecord, ChannelSendResult, EmailChannelProvider,
     _now_iso,
 )

@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from ..contracts import Category, ContractRegistry
-from ..channel_contract import (
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.channel_contract import (
     ChannelAuditRecord, ChannelSendResult, WebhookChannelProvider,
     _now_iso,
 )

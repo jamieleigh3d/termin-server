@@ -31,7 +31,7 @@ import sqlite3
 
 from fastapi import Request, HTTPException, WebSocket
 
-from .providers.identity_contract import (
+from termin_core.providers.identity_contract import (
     ANONYMOUS_PRINCIPAL, Principal, IdentityProvider,
     make_anonymous_principal,
 )

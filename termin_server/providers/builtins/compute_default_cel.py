@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ..contracts import Category, ContractRegistry
+from termin_core.providers.contracts import Category, ContractRegistry
 
 
 class DefaultCelProvider:
@@ -40,7 +40,7 @@ class DefaultCelProvider:
         # Lazy-import the evaluator to avoid pulling celpy into
         # contract-only test paths (some tests just check the registry
         # without needing an actual evaluator).
-        from ...expression import ExpressionEvaluator
+        from termin_core.expression.cel import ExpressionEvaluator
         self._config = dict(config or {})
         self._evaluator = ExpressionEvaluator()
 

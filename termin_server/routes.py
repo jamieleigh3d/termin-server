@@ -22,13 +22,13 @@ from .storage import (
     get_db, create_record, get_record, update_record, delete_record,
     list_records, find_by_field,
 )
-from .providers import (
+from termin_core.providers import (
     Eq, And, OrderBy, QueryOptions, CascadeMode,
 )
-from .state import do_state_transition
-from .confidentiality import redact_record, redact_records, check_write_access
-from .boundaries import check_boundary_identity
-from .validation import (
+from termin_core.state import do_state_transition
+from termin_core.confidentiality.redaction import redact_record, redact_records, check_write_access
+from termin_core.boundaries import check_boundary_identity
+from termin_core.validation import (
     validate_dependent_values, validate_enum_constraints,
     validate_min_max_constraints, evaluate_field_defaults, strip_unknown_fields,
 )
@@ -77,7 +77,7 @@ def _route_terminator(ctx, content_name: str, exc: Exception) -> None:
     re-raised by the caller — TerminAtor records, doesn't intercept."""
     if ctx.terminator is None:
         return
-    from .errors import TerminError
+    from termin_core.errors import TerminError
     ctx.terminator.route(TerminError(
         source=content_name, kind="validation", message=str(exc),
     ))

@@ -17,71 +17,16 @@ import re
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
+from termin_core.expression.compute_js import build_compute_js
+from termin_core.presentation.compose import extract_page_reqs
+
 from .context import RuntimeContext
 from .storage import get_db, create_record, update_record, list_records, find_by_field
-from .providers import Eq, QueryOptions
-from .confidentiality import redact_records
+from termin_core.providers import Eq, QueryOptions
+from termin_core.confidentiality.redaction import redact_records
 from .presentation import build_nav_html, build_base_template, build_page_template, build_merged_page_template
-from .validation import evaluate_field_defaults
+from termin_core.validation import evaluate_field_defaults
 from .bootstrap import page_should_use_shell, render_shell_response
-
-
-def extract_page_reqs(page: dict) -> dict:
-    """Walk component tree to find data sources, form targets, reference lists, etc."""
-    reqs = {
-        "sources": set(), "form_target": None, "ref_lists": set(),
-        "create_as": None, "unique_fields": set(), "after_save": None,
-    }
-
-    def _walk(children):
-        for child in (children or []):
-            t = child.get("type", "")
-            p = child.get("props", {})
-            if t in ("data_table", "chat"):
-                src = p.get("source")
-                if src:
-                    reqs["sources"].add(src)
-                _walk(child.get("children", []))
-            elif t == "form":
-                reqs["form_target"] = p.get("target")
-                reqs["create_as"] = p.get("create_as")
-                reqs["after_save"] = p.get("after_save")
-                _walk(child.get("children", []))
-            elif t == "field_input":
-                ref = p.get("reference_content")
-                if ref:
-                    reqs["ref_lists"].add(ref)
-                if p.get("validate_unique"):
-                    reqs["unique_fields"].add(p.get("field", ""))
-            elif t in ("aggregation", "stat_breakdown"):
-                src = p.get("source")
-                if src:
-                    reqs["sources"].add(src)
-            elif t == "section":
-                _walk(child.get("children", []))
-
-    _walk(page.get("children", []))
-    return reqs
-
-
-def build_compute_js(ir: dict) -> str:
-    """Build client-side compute JS registrations from IR."""
-    parts = []
-    for comp in ir.get("computes", []):
-        body_lines = comp.get("body_lines", [])
-        input_params = comp.get("input_params", [])
-        if body_lines and input_params:
-            param_name = input_params[0].get("name", "x") if input_params else "x"
-            for line in body_lines:
-                clean = line.strip().lstrip("[").rstrip("]").strip()
-                m = re.match(r'(\w+)\s*=\s*(.*)', clean)
-                if m:
-                    expr = m.group(2).strip()
-                    fname = comp["name"]["display"]
-                    parts.append(
-                        f'ctx["{fname}"] = function({param_name}) {{ return {expr}; }};')
-                    break
-    return "\n".join(parts)
 
 
 def register_page_routes(app, ctx: RuntimeContext):
@@ -296,7 +241,7 @@ def _register_form_post(app, ctx, page, slug, reqs):
             try:
                 updated = await ctx.storage.update(_ft, edit_id, data)
             except Exception as e:
-                from .errors import TerminError
+                from termin_core.errors import TerminError
                 if ctx.terminator:
                     ctx.terminator.route(TerminError(
                         source=_ft, kind="validation", message=str(e)))
@@ -331,7 +276,7 @@ def _register_form_post(app, ctx, page, slug, reqs):
             try:
                 record = await ctx.storage.create(_ft, data)
             except Exception as e:
-                from .errors import TerminError
+                from termin_core.errors import TerminError
                 if ctx.terminator:
                     ctx.terminator.route(TerminError(
                         source=_ft, kind="validation", message=str(e)))

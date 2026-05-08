@@ -30,8 +30,8 @@ from __future__ import annotations
 import time
 from typing import Any, AsyncIterator, Mapping, Optional
 
-from ..contracts import Category, ContractRegistry
-from ..compute_contract import (
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.compute_contract import (
     AgentContext, AgentEvent, AgentResult, AuditableAction, AuditRecord,
     Completed, Cost, Failed, ToolCall, ToolCalled, ToolNotDeclared,
     ToolResult, ToolSurface,

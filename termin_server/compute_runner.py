@@ -23,15 +23,15 @@ from .storage import (
     get_db, create_record, get_record, update_record,
     list_records, filtered_query, update_fields, insert_raw, select_column,
 )
-from .state import do_state_transition
+from termin_core.state import do_state_transition
 from .ai_provider import AIProviderError, build_output_tool, build_agent_tools
-from .confidentiality import (
+from termin_core.confidentiality.redaction import (
     check_compute_access, check_taint_integrity, enforce_output_taint,
     check_for_redacted_values,
 )
-from .errors import TerminError
-from .transaction import Transaction, ContentSnapshot
-from .boundaries import check_boundary_access
+from termin_core.errors import TerminError
+from termin_core.transaction import Transaction, ContentSnapshot
+from termin_core.boundaries import check_boundary_access
 from .fastapi_adapter import make_auth_context
 from termin_core.routing import build_the_user_for_cel
 

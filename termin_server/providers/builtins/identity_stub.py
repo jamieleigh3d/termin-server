@@ -28,8 +28,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Mapping
 
-from ..contracts import Category, ContractRegistry
-from ..identity_contract import Principal
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.identity_contract import Principal
 
 
 class StubIdentityProvider:

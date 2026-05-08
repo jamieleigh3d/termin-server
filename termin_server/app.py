@@ -31,22 +31,22 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import RedirectResponse
 
 from .context import RuntimeContext
-from .expression import ExpressionEvaluator
-from .errors import TerminAtor
-from .events import EventBus
+from termin_core.expression.cel import ExpressionEvaluator
+from termin_core.errors import TerminAtor
+from termin_core.events import EventBus
 from .identity import make_get_current_user, make_require_scope, make_get_user_from_websocket
-from .providers import (
+from termin_core.providers import (
     Category, ContractRegistry, ProviderRegistry, initial_deploy_diff,
 )
 from .providers.builtins import register_builtins as register_builtin_providers
 from .storage import get_db, init_db, create_record, insert_raw, count_records
-from .reflection import ReflectionEngine, register_reflection_with_expr_eval
-from .channels import ChannelDispatcher, load_deploy_config, check_deploy_config_warnings
-from .scheduler import Scheduler, parse_schedule_interval
+from termin_core.reflection import ReflectionEngine, register_reflection_with_expr_eval
+from termin_core.channels import ChannelDispatcher, load_deploy_config, check_deploy_config_warnings
+from termin_core.scheduler import Scheduler, parse_schedule_interval
 
 # Subsystem modules
 from .websocket_manager import ConnectionManager, register_websocket_routes
-from .boundaries import build_boundary_maps
+from termin_core.boundaries import build_boundary_maps
 from .transitions import build_transition_feedback, register_transition_routes
 from .routes import (
     register_crud_routes, register_reflection_routes, register_channel_routes,
@@ -226,8 +226,8 @@ def _populate_presentation_providers(
     contracts — calling the factory ten times with the same config
     would create ten redundant instances.
     """
-    from termin_server.providers.contracts import Category
-    from termin_server.providers.presentation_contract import (
+    from termin_core.providers.contracts import Category
+    from termin_core.providers.presentation_contract import (
         PRESENTATION_BASE_CONTRACTS,
     )
 
@@ -708,7 +708,7 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
     # consult it to authorize each tool call. Stashed on ctx keyed
     # by compute snake-name. Skipped for llm and default-CEL
     # computes — those don't have a tool surface.
-    from .providers.compute_contract import ToolSurface as _ToolSurface
+    from termin_core.providers.compute_contract import ToolSurface as _ToolSurface
     for comp in ir.get("computes", []):
         if comp.get("provider") != "ai-agent":
             continue
@@ -1120,12 +1120,12 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
         # renames, downgrade for empty tables, gate on ack, create
         # backup if high risk, apply atomically with validation.
         # See docs/migration-classifier-design.md for the design.
-        from .migrations import (
+        from termin_core.migrations import (
             compute_migration_diff, apply_rename_mappings,
             downgrade_for_empty_tables, ack_covers,
             format_blocked_error, format_unacked_error,
         )
-        from .migrations.errors import (
+        from termin_core.migrations.errors import (
             MigrationBlockedError, MigrationAckRequiredError,
             MigrationBackupRefusedError,
         )

@@ -14,7 +14,7 @@ architecture.
 To register all built-in providers in one call, use
 `register_builtins(registry)` from this package:
 
-    from termin_server.providers import ProviderRegistry, ContractRegistry
+    from termin_core.providers import ProviderRegistry, ContractRegistry
     from termin_server.providers.builtins import register_builtins
 
     contracts = ContractRegistry.default()

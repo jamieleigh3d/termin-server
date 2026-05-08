@@ -38,8 +38,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from ..contracts import Category, ContractRegistry
-from ..compute_contract import (
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.compute_contract import (
     AuditRecord, CompletionResult, LlmComputeProvider,
 )
 from ._provider_hash import hash_provider_config

@@ -333,7 +333,7 @@ async def create_record(db, content_name: str, data: dict, schema: dict = None,
         return record
     except Exception as e:
         if terminator:
-            from .errors import TerminError
+            from termin_core.errors import TerminError
             terminator.route(TerminError(source=content_name, kind="validation", message=str(e)))
         raise
 
@@ -463,7 +463,7 @@ async def update_record(db, content_name: str, id_value, data: dict,
         return record
     except Exception as e:
         if terminator:
-            from .errors import TerminError
+            from termin_core.errors import TerminError
             terminator.route(TerminError(source=content_name, kind="validation", message=str(e)))
         raise
 
@@ -492,7 +492,7 @@ async def delete_record(db, content_name: str, id_value,
                 f"other records reference it. Remove or reassign those first."
             )
             if terminator:
-                from .errors import TerminError
+                from termin_core.errors import TerminError
                 terminator.route(TerminError(
                     source=content_name, kind="validation", message=detail))
             raise HTTPException(status_code=409, detail=detail)

@@ -5,6 +5,87 @@ All notable changes to `termin-server` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] — 2026-05-07
+
+The runtime extraction release. Internal API surface only — no IR
+change, no DSL change. Per `RELEASE_PROCESS.md` §2 (in the
+compiler repo), this is a patch release: additive Python API, no
+removal of public surface. Tech design at
+`termin-compiler/docs/termin-v0.9.3-runtime-extraction-tech-design.md`.
+
+`termin-server` loses ~3500 lines of framework-free orchestration
+code to `termin-core` and drops 16 re-export shim files (the
+slice 7.1 shim layer that landed in v0.9.0). Server-internal
+imports + `termin-spectrum-provider` + `termin-conformance` updated
+to import from `termin_core.X` directly.
+
+### Removed (the no-shims sweep)
+
+- `termin_server.errors`, `.state`, `.validation`, `.expression`,
+  `.confidentiality`, `.cel_predicate` — all six were
+  `from termin_core.X import *` shims. Deleted.
+- `termin_server.providers.binding`, `.contracts`,
+  `.deploy_config`, `.registry`, `.storage_contract`,
+  `.identity_contract`, `.channel_contract`, `.compute_contract`,
+  `.presentation_contract` — all ten were re-exports of
+  `termin_core.providers.X`. Deleted. The `providers/` package
+  itself stays as a marker; concrete IO providers
+  (`builtins/storage_sqlite.py`, `builtins/compute_*.py`,
+  `builtins/channel_*_stub.py`, etc.) continue to live there.
+
+### Moved to `termin-core`
+
+- `events.py`, `scheduler.py`, `transaction.py`, `reflection.py`
+  — runtime infrastructure.
+- `boundaries.py`, `colorblind.py`, `markdown_sanitizer.py` —
+  security + accessibility primitives.
+- `migrations/` — IR migration package.
+- `channels.py`, `channel_config.py`, `channel_ws.py` — channel
+  dispatch.
+- `pages.build_compute_js` — extracted to
+  `termin_core.expression.compute_js`.
+- `pages.extract_page_reqs` — extracted to
+  `termin_core.presentation.compose`. The `build_*template`
+  Jinja-binding functions stay here; they return Jinja2
+  `Template` objects and use the Jinja-bound `render_component`
+  dispatch table.
+- `ai_provider.py` SDK-agnostic helpers (`materialize_to_anthropic`,
+  `entry_role`, `build_content_blocks`,
+  `build_invokable_compute_tools`, `truncate_purpose`,
+  `purpose_property`, `add_purpose_to_tool`, plus the canonical
+  kind sets and `ConversationMaterializationError`) — extracted to
+  `termin_core.compute.materialize`. The Anthropic SDK call site
+  stays here under `AIProvider`. `build_agent_tools` and
+  `build_output_tool` keep their richer server-local versions
+  (with `state_transition`, `system_refuse`, per-content schema
+  elaboration); core ships scaffold versions for alt runtimes to
+  extend.
+
+### Kept (with rationale)
+
+- `_do_append` in `routes.py` — server-local parallel
+  implementation. Uses `aiosqlite`-direct `update_record(...,
+  event_bus=None)` to suppress the standard `_updated` event so it
+  doesn't double-fire alongside the field-specific `appended`
+  event. Core's `append_to_field` uses `ctx.storage.update(...)`
+  via the StorageProvider Protocol, which doesn't expose the
+  event-suppression hook today. v0.10 cleanup either teaches
+  `StorageProvider.update` to accept the flag or refactors the
+  reference runtime to fire one event from the append path.
+- `presentation.py` Jinja2 SSR renderer — bound to Jinja2 by
+  design.
+- `storage.py` (aiosqlite), `app.py`, `bootstrap.py`, `routes.py`,
+  `pages.py` (FastAPI handlers), `identity.py`, `transitions.py`,
+  `websocket_manager.py`, `presentation_bundles.py`,
+  `fastapi_adapter.py` — framework-bound modules stay where they
+  are.
+- `providers/builtins/` — concrete IO providers (SQLite storage,
+  Anthropic LLM/agent, Tailwind SSR renderer, channel stubs).
+
+### Test count
+
+- 98 passing.
+
 ## [0.9.2] — 2026-05-05
 
 Conversation-field runtime release. Implements the runtime side of

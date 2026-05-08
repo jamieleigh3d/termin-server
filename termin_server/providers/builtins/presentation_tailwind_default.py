@@ -29,8 +29,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from ..contracts import Category, ContractRegistry
-from ..presentation_contract import (
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_core.providers.presentation_contract import (
     PRESENTATION_BASE_CONTRACTS,
     PresentationData,
     PrincipalContext,

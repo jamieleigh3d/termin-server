@@ -43,9 +43,9 @@ from typing import Any, Mapping, Optional, Sequence
 
 import aiosqlite
 
-from .. import storage_contract as sc
-from ..contracts import Category, ContractRegistry
-from ... import storage as _storage
+from termin_core.providers import storage_contract as sc
+from termin_core.providers.contracts import Category, ContractRegistry
+from termin_server import storage as _storage
 
 
 class SqliteStorageProvider:
@@ -438,7 +438,7 @@ class SqliteStorageProvider:
         Returns None when the database is brand-new (no tables at
         all). The runtime then runs an initial-deploy migration.
         """
-        from ...migrations.introspect import introspect_sqlite_schema
+        from termin_core.migrations.introspect import introspect_sqlite_schema
         db = await self._connect()
         try:
             # Does the metadata table exist?

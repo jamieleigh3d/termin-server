@@ -12,12 +12,41 @@ Supports two modes:
 
 Built-in providers: Anthropic (Claude) and OpenAI (GPT).
 Provider is selected via deploy config ai_provider section.
+
+v0.9.3 (2026-05-07): the SDK-agnostic conversation + tool-spec
+materialization helpers moved to
+``termin_core.compute.materialize``. This module re-imports them
+under their legacy (underscore-prefixed) names so internal call
+sites in this file continue to work; new code should prefer the
+public names exported by ``termin_core.compute``.
 """
 
 import asyncio
 import json
 import logging
 from typing import Any, Optional
+
+# v0.9.3: SDK-agnostic helpers extracted to termin-core. Imported
+# here under legacy names for the rest of this module's internals.
+# Note: ``build_output_tool`` and ``build_agent_tools`` are NOT
+# imported from core — server retains its richer local versions
+# (which add state_transition, system_refuse, and per-content
+# elaboration). Core's versions are a basic scaffold for alt
+# runtimes to extend.
+from termin_core.compute.materialize import (
+    CANONICAL_KINDS_USER_ROLE as _KINDS_USER_ROLE,
+    CANONICAL_KINDS_ASSISTANT_ROLE as _KINDS_ASSISTANT_ROLE,
+    PURPOSE_MAX_WORDS as _PURPOSE_MAX_WORDS,
+    PURPOSE_TOOL_DESCRIPTION as _PURPOSE_TOOL_DESCRIPTION,
+    ConversationMaterializationError,
+    materialize_to_anthropic,
+    entry_role as _entry_role,
+    build_content_blocks as _build_content_blocks,
+    truncate_purpose as _truncate_purpose,
+    purpose_property as _purpose_property,
+    add_purpose_to_tool as _add_purpose_to_tool,
+    build_invokable_compute_tools,
+)
 
 logger = logging.getLogger("termin.ai_provider")
 
@@ -27,60 +56,11 @@ class AIProviderError(Exception):
     pass
 
 
-class ConversationMaterializationError(Exception):
-    """v0.9.2 §11.4: a conversation entry list violated the canonical
-    materialization contract (e.g. a tool_result whose tool_call_id
-    doesn't match any preceding tool_call). Raised by
-    ``materialize_to_anthropic``; the runtime treats it as a
-    server-side error (the source-of-truth field has bad data the
-    runtime can't translate into a valid provider call)."""
-
-
-# ── v0.9.2 L7.2: canonical kind → Anthropic mapping ──
-#
-# Per tech-design §11.4 (verified against Anthropic API docs):
-#   Termin kind     | Anthropic role | content blocks
-#   user            | user           | {type:text} + image/document blocks
-#   assistant       | assistant      | {type:text} (+ image blocks where supported)
-#   tool_call       | assistant      | {type:tool_use, id, name, input}
-#   tool_result     | user           | {type:tool_result, tool_use_id, content, is_error?}
-#   system_event    | user           | {type:text, text:"[<source>] <body>"}
-#
-# The `assistant.type == "refusal"` discriminator is **not** sent to
-# Anthropic — refusal-type assistant entries map identically to
-# response-type ones. The type field is for Termin's audit and chat
-# rendering only. Per tech-design §11.4.
-#
-# Adjacent same-role entries are merged into one message with multiple
-# content blocks (Anthropic requires alternating user/assistant
-# roles).
-#
-# Tool linkage rule: every tool_result must reference a tool_call_id
-# that appears in a prior tool_call entry. Orphan tool_results raise
-# ConversationMaterializationError.
-
-_KINDS_USER_ROLE = frozenset({"user", "tool_result", "system_event"})
-# v0.9.2 close-out (2026-05-05): both the new canonical `agent` kind
-# and the legacy `assistant` kind map to Anthropic's role="assistant".
-# Storage keeps whatever kind the caller wrote; only the wire shape
-# to the provider is normalized.
-_KINDS_ASSISTANT_ROLE = frozenset({"agent", "assistant", "tool_call"})
-
-
-# ── v0.9.2 close-out: `purpose` field on tool_call entries ──
-#
-# Per JL's Q2 (today): tool_call entries can carry an optional
-# `purpose` field — a short (6 words ideal, 12-word hard cap with
-# ellipsis truncation) display string the agent supplies for each
-# tool call. Lets chat UIs show a meaningful label without parsing
-# the JSON args.
-#
-# The runtime extracts `purpose` from the agent's tool_use input
-# during materialization, truncates at the hard cap, and persists
-# it on the conversation entry as a top-level field. The agent's
-# remaining args (with `purpose` stripped) go to the tool callback.
-
-_PURPOSE_MAX_WORDS = 12
+# Canonical kind → Anthropic mapping per v0.9.2 tech-design §11.4
+# lives in ``termin_core.compute.materialize``. The constants
+# ``_KINDS_USER_ROLE``, ``_KINDS_ASSISTANT_ROLE`` and
+# ``_PURPOSE_MAX_WORDS`` re-imported above keep internal usage
+# unchanged.
 
 
 def _producer_for_conversation_stream(stream_events, put) -> None:
@@ -126,291 +106,18 @@ def _producer_for_conversation_stream(stream_events, put) -> None:
             if text:
                 put({"type": "text_delta", "text": text})
 
-_PURPOSE_TOOL_DESCRIPTION = (
-    "Short, 6-words-or-less, plain-English description of why you're "
-    "calling this tool — for chat-UI display. Examples: "
-    "'checking the time', 'looking up the order', 'updating the "
-    "ticket status'. Hard truncated at 12 words with ellipsis on "
-    "persistence."
-)
+# ``_PURPOSE_TOOL_DESCRIPTION``, ``_truncate_purpose``,
+# ``_purpose_property``, and ``_add_purpose_to_tool`` are imported
+# above from ``termin_core.compute.materialize``.
 
 
-def _truncate_purpose(text: str, max_words: int = _PURPOSE_MAX_WORDS) -> str:
-    """Hard-truncate a purpose string to ``max_words`` (default 12)
-    with ellipsis when over. Collapses runs of whitespace via
-    ``str.split()`` default semantics."""
-    if not text:
-        return ""
-    words = text.split()
-    if len(words) <= max_words:
-        return " ".join(words)
-    return " ".join(words[:max_words]) + "..."
+# ``build_invokable_compute_tools`` is imported above from
+# ``termin_core.compute.materialize``.
 
 
-def _purpose_property() -> dict:
-    """The Anthropic JSON-schema property dict for the `purpose`
-    field. Added to every tool's input_schema by the conversation-
-    mode tool-surface builder so the agent is consistently prompted
-    to supply intent."""
-    return {
-        "type": "string",
-        "description": _PURPOSE_TOOL_DESCRIPTION,
-    }
-
-
-def _add_purpose_to_tool(tool: dict) -> dict:
-    """Return a shallow copy of ``tool`` with `purpose` added to its
-    input_schema's properties (idempotent — no-op if already present).
-    Does NOT mark `purpose` as required; agents are encouraged to
-    supply it but the chat UI falls back to body when absent."""
-    tool = dict(tool)
-    schema = dict(tool.get("input_schema") or {})
-    props = dict(schema.get("properties") or {})
-    if "purpose" not in props:
-        props["purpose"] = _purpose_property()
-    schema["properties"] = props
-    tool["input_schema"] = schema
-    return tool
-
-
-# ── v0.9.2 close-out: Invokes runtime wiring ──
-#
-# `Invokes "<compute_name>"` declarations on an ai-agent compute
-# surface the named compute as an agent tool. v0.9.2 supports
-# default-CEL invokable tools only; LLM and ai-agent invocations
-# from another agent are reserved for future slices (the wiring
-# here doesn't emit tools for non-CEL providers — cleanly ignored).
-
-
-def build_invokable_compute_tools(
-    invokes_list: list[str],
-    computes_lookup: dict,
-) -> list[dict]:
-    """Build Anthropic-shape tool schemas for each compute named in
-    the agent's Invokes declarations. Per the v0.9.2 design §11:
-    tool name = compute snake_name; description from the compute's
-    display_name + first-line directive (when present); input schema
-    derived from the compute's input_params.
-
-    v0.9.2 supports default-CEL providers only. Computes with
-    provider="llm" or "ai-agent" are skipped (logged as future).
-    Unknown invokes (compute not in lookup) are also skipped — the
-    analyzer should have caught this at compile time, but the
-    runtime is forgiving.
-    """
-    tools = []
-    for invoke_name in invokes_list:
-        comp = computes_lookup.get(invoke_name)
-        if comp is None:
-            continue
-        provider = comp.get("provider") or "cel"
-        # Only default-CEL is wired in v0.9.2.
-        if provider not in ("cel", "default-CEL", None, ""):
-            continue
-        name = comp.get("name", {})
-        snake = name.get("snake") if isinstance(name, dict) else invoke_name
-        display = name.get("display") if isinstance(name, dict) else invoke_name
-        directive = (comp.get("directive") or "").strip().splitlines()
-        first_line = directive[0] if directive else ""
-        description = display
-        if first_line:
-            description = f"{display} — {first_line}"
-        properties = {}
-        required = []
-        for param in comp.get("input_params") or ():
-            pname = param.get("name") if isinstance(param, dict) else getattr(param, "name", None)
-            ptype = param.get("type_name") if isinstance(param, dict) else getattr(param, "type_name", None)
-            if not pname:
-                continue
-            # Param types are content-type singulars; v0.9.2 ships
-            # an object-typed schema for each (the agent passes a
-            # record-shaped dict; the runtime evaluates the body
-            # with that dict bound to the param name).
-            properties[pname] = {
-                "type": "object",
-                "description": (
-                    f"The {ptype} record this compute operates on."
-                    if ptype else
-                    f"The {pname} input."
-                ),
-                "additionalProperties": True,
-            }
-            required.append(pname)
-        schema = {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-        }
-        tools.append({
-            "name": snake,
-            "description": description,
-            "input_schema": schema,
-        })
-    return tools
-
-
-def _entry_role(kind: str) -> str:
-    """Map a Termin entry kind to its Anthropic role."""
-    if kind in _KINDS_ASSISTANT_ROLE:
-        return "assistant"
-    if kind in _KINDS_USER_ROLE:
-        return "user"
-    # Defensive: callers should validate kind upstream (the append
-    # endpoint enforces _CANONICAL_KINDS); fall back to user role.
-    return "user"
-
-
-def _build_content_blocks(entry: dict) -> list[dict]:
-    """Build the Anthropic content-blocks list for a single entry.
-
-    The block shape depends on the entry's kind:
-      - user / assistant / system_event → text block (+ attachments
-        for user)
-      - tool_call → tool_use block
-      - tool_result → tool_result block
-    """
-    kind = entry.get("kind", "")
-    body = entry.get("body", "")
-
-    if kind == "tool_call":
-        return [{
-            "type": "tool_use",
-            "id": entry.get("tool_call_id", ""),
-            "name": entry.get("tool_name", ""),
-            "input": entry.get("tool_args") or {},
-        }]
-
-    if kind == "tool_result":
-        block: dict = {
-            "type": "tool_result",
-            "tool_use_id": entry.get("tool_call_id", ""),
-            "content": body,
-        }
-        if entry.get("is_error"):
-            block["is_error"] = True
-        return [block]
-
-    # text-bearing kinds: user, assistant, system_event
-    if kind == "system_event":
-        # Wrap with source prefix so the in-band context is
-        # distinguishable from real user input. Per §11.4.
-        source = entry.get("source", "system") or "system"
-        text = f"[{source}] {body}"
-    else:
-        text = body
-
-    blocks: list[dict] = [{"type": "text", "text": text}]
-
-    # Attachments ride alongside text in the same content array
-    # (image/document blocks per §11.4 attachments rule). Only
-    # user-kind entries carry attachments in v0.9.2; assistant
-    # attachments are out of scope for v0.9.2 (depends on
-    # Anthropic's per-model assistant-image acceptance).
-    if kind == "user":
-        for att in entry.get("attachments") or ():
-            media_type = (att.get("media_type") or "").lower()
-            source = att.get("source") or {}
-            if media_type.startswith("image/"):
-                blocks.append({
-                    "type": "image",
-                    "source": source,
-                })
-            elif media_type == "application/pdf":
-                blocks.append({
-                    "type": "document",
-                    "source": source,
-                })
-            # Unknown media types are dropped silently — the runtime's
-            # append-time validation should have caught them.
-
-    return blocks
-
-
-def materialize_to_anthropic(entries) -> list[dict]:
-    """Translate a Termin conversation field's entry list into
-    Anthropic's messages array per §11.4.
-
-    Returns: ``list[{role, content: list[block]}]`` ready to pass to
-    ``anthropic.messages.create(messages=...)``.
-
-    Raises ``ConversationMaterializationError`` on:
-      - tool_result with tool_call_id that doesn't match a prior
-        tool_call entry (orphan).
-
-    v0.9.2 close-out (2026-05-05): orphan tool_call entries (a
-    tool_call with no matching tool_result) are SILENTLY DROPPED.
-    Anthropic rejects messages arrays with unmatched tool_use
-    blocks (HTTP 400: "tool_use ids were found without tool_result
-    blocks immediately after"). The runtime never writes orphan
-    tool_calls in v0.9.2+ (system_refuse intentionally skips
-    on_writeback per ai_provider's loop), but JL's local SQLite
-    from earlier testing contains the legacy orphan pattern.
-    Skipping at materialization time means existing chats recover
-    cleanly without requiring a data migration.
-
-    Adjacent same-role entries merge into one message with the
-    blocks concatenated (Anthropic requires alternating user/
-    assistant roles).
-    """
-    if not entries:
-        return []
-
-    # First pass: build the set of tool_call_ids that have matching
-    # tool_results. Orphan tool_calls (no matching result) get
-    # dropped at materialization time per the v0.9.2 close-out
-    # mitigation.
-    matched_tool_call_ids: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("kind") == "tool_result":
-            tcid = entry.get("tool_call_id", "")
-            if tcid:
-                matched_tool_call_ids.add(tcid)
-
-    seen_tool_call_ids: set[str] = set()
-    messages: list[dict] = []
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        kind = entry.get("kind", "")
-        if not kind:
-            continue
-
-        # Tool linkage validation — done before we map the entry so
-        # we don't half-build a turn before failing.
-        if kind == "tool_call":
-            tcid = entry.get("tool_call_id", "")
-            # Orphan tool_call (no matching tool_result later in
-            # the conversation) — drop. Common case: legacy
-            # system_refuse entries from before the v0.9.2
-            # close-out fix that stopped persisting them.
-            if tcid and tcid not in matched_tool_call_ids:
-                continue
-            if tcid:
-                seen_tool_call_ids.add(tcid)
-        elif kind == "tool_result":
-            tcid = entry.get("tool_call_id", "")
-            if not tcid or tcid not in seen_tool_call_ids:
-                raise ConversationMaterializationError(
-                    f"tool_result entry references unknown "
-                    f"tool_call_id {tcid!r}; no preceding tool_call "
-                    f"with that id."
-                )
-
-        role = _entry_role(kind)
-        blocks = _build_content_blocks(entry)
-        if not blocks:
-            continue
-
-        if messages and messages[-1]["role"] == role:
-            # Adjacent same-role merge.
-            messages[-1]["content"].extend(blocks)
-        else:
-            messages.append({"role": role, "content": list(blocks)})
-
-    return messages
+# ``_entry_role``, ``_build_content_blocks``, and
+# ``materialize_to_anthropic`` are imported above from
+# ``termin_core.compute.materialize``.
 
 
 class StreamingJsonFieldExtractor:

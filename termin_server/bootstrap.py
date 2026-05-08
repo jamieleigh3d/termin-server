@@ -52,9 +52,9 @@ from typing import Iterable, Optional
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .confidentiality import redact_records
+from termin_core.confidentiality.redaction import redact_records
 from .presentation_bundles import collect_csr_bundles
-from .providers import QueryOptions
+from termin_core.providers import QueryOptions
 
 
 # ── Page-IR resolution ──

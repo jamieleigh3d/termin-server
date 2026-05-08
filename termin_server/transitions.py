@@ -17,7 +17,7 @@ from fastapi.responses import RedirectResponse
 
 from .context import RuntimeContext
 from .storage import get_record_by_id
-from .state import do_state_transition
+from termin_core.state import do_state_transition
 
 
 def build_transition_feedback(ir: dict) -> dict:
