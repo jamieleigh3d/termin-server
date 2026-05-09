@@ -5,6 +5,53 @@ All notable changes to `termin-server` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **SQLite is now the per-runtime serialization boundary for
+  list/dict-typed fields (issue #5).** Storage Protocol callers in
+  framework-free code (the v0.9.3 ``termin_core.routing.append``
+  helper, CRUD handlers, channel handlers) pass *native* Python
+  objects per the Provider contract — each storage implementation
+  owns its own serialization. Pre-fix, ``aiosqlite`` rejected
+  list/dict parameter bindings outright with
+  ``sqlite3.ProgrammingError: Error binding parameter N: type
+  'list' is not supported``, blocking the v0.9.3 ``append_to_field``
+  from being adoptable end-to-end. Added a small
+  ``_serialize_for_sqlite`` helper at the parameter-binding
+  boundary in ``termin_server.storage`` and applied it to
+  ``create_record``, ``update_record``, ``update_fields``, and
+  ``insert_raw``. Native list/dict patch values are now JSON-encoded
+  here on the way to ``aiosqlite``; primitives pass through
+  unchanged. The SQLite ``StorageProvider`` (which delegates to
+  these helpers) inherits the fix automatically.
+- **Legacy ``_do_append`` in ``termin_server.routes`` brought into
+  lock-step with ``termin_core.routing.append.append_to_field``
+  (issue #5).** The dual-implementation path that
+  ``termin-server`` keeps for the SQLite event-suppression hook
+  also had the same SQLite-specific ``json.dumps`` / ``json.loads``
+  leak. Both implementations now share the same
+  storage-Protocol-shaped contract: read accepts native list /
+  JSON text / None / empty / malformed-degraded-to-empty; write
+  passes a native list. The SQLite serialization happens at the
+  ``_serialize_for_sqlite`` boundary above.
+- 4 new unit tests in
+  ``tests/test_storage_unit.py::TestStructuredFieldSerialization``
+  pin the SQLite-side serialization contract:
+  ``update_record`` / ``update_fields`` / ``insert_raw`` accept
+  native lists and dicts; primitives still round-trip unchanged.
+
+### Compatibility
+
+- Backwards-compatible. SQLite-stored TEXT columns continue to
+  hold the same JSON-encoded shape they did pre-fix; the
+  difference is that the SQLite layer now does the encoding
+  instead of leaving it to the caller. No data migration needed.
+- Pair-fix in ``termin-core`` v0.9.3-Unreleased makes
+  ``append_to_field`` storage-Protocol agnostic. The two changes
+  ship as one logical fix split across the package boundary.
+
 ## [0.9.3] — 2026-05-07
 
 The runtime extraction release. Internal API surface only — no IR

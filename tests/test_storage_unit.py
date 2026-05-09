@@ -155,3 +155,128 @@ class TestCrudRoundTrip:
             finally:
                 await db.close()
         _run(go())
+
+
+class TestStructuredFieldSerialization:
+    """Issue #5: SQLite is the per-runtime serialization boundary for
+    list/dict-typed fields. Storage Protocol callers (append_to_field,
+    crud handlers, channel handlers) must be able to pass native Python
+    objects and have the SQLite provider serialize them to JSON text
+    on the way in. Pre-fix, ``aiosqlite`` rejected list/dict parameter
+    bindings outright with ``InterfaceError``.
+    """
+
+    @pytest.fixture
+    def conv_db(self, tmp_path) -> str:
+        """Schema with a TEXT-typed structured/conversation column."""
+        db_path = str(tmp_path / "conv.db")
+        schemas = [{
+            "name": {"snake": "tickets", "pascal": "Tickets",
+                     "display": "tickets"},
+            "singular": "ticket",
+            "fields": [
+                {"name": "title", "column_type": "TEXT", "required": True},
+                # Conversation field — TEXT column holding a JSON list
+                # per termin_server.storage._SQL_TYPES["conversation"].
+                {"name": "messages", "column_type": "TEXT"},
+            ],
+        }]
+
+        async def setup():
+            await storage.init_db(schemas, db_path=db_path)
+
+        _run(setup())
+        return db_path
+
+    def test_update_record_serializes_native_list(self, conv_db):
+        """update_record must accept a native Python list as a patch
+        value and persist it as JSON text. Pre-fix, this raised
+        ``InterfaceError: Error binding parameter 0: type 'list' is
+        not supported``."""
+        import json as _json
+
+        async def go():
+            db = await storage.get_db(db_path=conv_db)
+            try:
+                rec = await storage.create_record(
+                    db, "tickets", {"title": "first"})
+                pid = rec["id"]
+                entries = [{"id": "e1", "kind": "user", "body": "hi"}]
+                # The contract under test: a native list passed in,
+                # round-trips through SQLite as a JSON-text column.
+                await storage.update_record(
+                    db, "tickets", pid, {"messages": entries})
+                updated = await storage.get_record(db, "tickets", pid)
+                assert updated["messages"] is not None
+                # SQLite stores TEXT — read back as a string and
+                # decode. The decoded value must be the original list.
+                decoded = _json.loads(updated["messages"])
+                assert decoded == entries
+            finally:
+                await db.close()
+        _run(go())
+
+    def test_update_fields_serializes_native_dict(self, conv_db):
+        """update_fields (the lower-level helper used by the SQLite
+        StorageProvider) must also serialize native dict patch
+        values to JSON text on the way in."""
+        import json as _json
+
+        async def go():
+            db = await storage.get_db(db_path=conv_db)
+            try:
+                rec = await storage.create_record(
+                    db, "tickets", {"title": "second"})
+                pid = rec["id"]
+                # update_fields filters None/"" but should keep dict.
+                await storage.update_fields(
+                    db, "tickets", pid,
+                    {"messages": {"latest": "value", "count": 3}})
+                updated = await storage.get_record(db, "tickets", pid)
+                assert updated["messages"] is not None
+                decoded = _json.loads(updated["messages"])
+                assert decoded == {"latest": "value", "count": 3}
+            finally:
+                await db.close()
+        _run(go())
+
+    def test_insert_raw_serializes_native_list(self, conv_db):
+        """insert_raw is the low-level INSERT helper used by SQLite
+        StorageProvider.create(). Native list/dict values for
+        structured columns must be serialized identically."""
+        import json as _json
+
+        async def go():
+            db = await storage.get_db(db_path=conv_db)
+            try:
+                entries = [{"id": "e1", "kind": "user", "body": "seeded"}]
+                row_id = await storage.insert_raw(
+                    db, "tickets",
+                    {"title": "third", "messages": entries})
+                updated = await storage.get_record(db, "tickets", row_id)
+                assert updated["messages"] is not None
+                decoded = _json.loads(updated["messages"])
+                assert decoded == entries
+            finally:
+                await db.close()
+        _run(go())
+
+    def test_primitive_patch_values_unchanged(self, conv_db):
+        """Sanity: strings, ints, and existing JSON-text strings must
+        keep round-tripping unchanged. The serialization step targets
+        list/dict only."""
+        async def go():
+            db = await storage.get_db(db_path=conv_db)
+            try:
+                rec = await storage.create_record(
+                    db, "tickets",
+                    {"title": "fourth", "messages": '[{"already": "json"}]'})
+                pid = rec["id"]
+                await storage.update_record(
+                    db, "tickets", pid, {"title": "renamed"})
+                updated = await storage.get_record(db, "tickets", pid)
+                assert updated["title"] == "renamed"
+                assert updated["messages"] == '[{"already": "json"}]'
+            finally:
+                await db.close()
+        _run(go())

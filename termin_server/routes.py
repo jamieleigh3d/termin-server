@@ -584,17 +584,25 @@ async def _do_append(
         if owner_field and record.get(owner_field) != user_id:
             raise AppendNotFoundError("Not found")
 
-    # Read existing entries (TEXT column holding a JSON array).
+    # Read existing entries. The SQLite reference runtime stores this
+    # field as a TEXT column holding the JSON encoding, so the raw
+    # value comes back as a string. Issue #5: we still also accept a
+    # native list — the underlying ``get_record`` is SQLite-shaped
+    # today, but mirrors the framework-free ``append_to_field`` in
+    # ``termin_core.routing.append`` so the two implementations stay
+    # in lock-step until the v0.10 consolidation lands.
     raw = record.get(field_name)
-    if raw in (None, ""):
+    if isinstance(raw, list):
+        entries = list(raw)
+    elif raw in (None, ""):
         entries = []
     else:
         try:
-            entries = json.loads(raw)
-            if not isinstance(entries, list):
-                entries = []
+            decoded = json.loads(raw)
         except (TypeError, ValueError):
             entries = []
+        else:
+            entries = decoded if isinstance(decoded, list) else []
 
     # Build the new entry with canonical metadata. Optional
     # caller-supplied fields pass through unchanged; runtime owns
@@ -622,9 +630,15 @@ async def _do_append(
             entry[k] = payload[k]
 
     entries.append(entry)
+    # Issue #5: pass the native Python list to ``update_record``;
+    # SQLite's ``_serialize_for_sqlite`` (in storage.py) JSON-encodes
+    # list/dict patch values at the parameter-binding boundary. This
+    # mirrors the ``ctx.storage.update`` contract used by
+    # ``termin_core.routing.append.append_to_field`` so the two
+    # implementations cannot drift on serialization shape.
     updated_record = await update_record(
         db, content_ref, key_val,
-        {field_name: json.dumps(entries)},
+        {field_name: entries},
         terminator=ctx.terminator,
         event_bus=None,   # the standard _updated event is suppressed —
                           # L5 publishes the field-specific .appended event

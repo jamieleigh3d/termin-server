@@ -10,10 +10,35 @@ Provides get_db(), init_db(), and generic CRUD helpers that work with
 any Content schema defined in the IR.
 """
 
+import json
 import re
 
 import aiosqlite
 from pathlib import Path
+
+
+def _serialize_for_sqlite(value):
+    """Wrap list/dict patch values in JSON text so aiosqlite parameter
+    binding accepts them.
+
+    Issue #5 (2026-05-08): the SQLite reference runtime stores
+    list/structured/conversation fields as TEXT columns holding the
+    JSON encoding (per ``_SQL_TYPES``). Storage Protocol callers in
+    framework-free code (``termin_core.routing.append``, the CRUD
+    handlers, channel handlers) pass *native* Python objects per the
+    Provider contract — each storage implementation owns its own
+    serialization. This helper is the SQLite-side serialization
+    boundary.
+
+    aiosqlite's parameter binding only accepts text / int / real /
+    blob / None; passing a ``list`` or ``dict`` raises
+    ``sqlite3.ProgrammingError: Error binding parameter N: type 'list'
+    is not supported``. We wrap those in ``json.dumps`` here, leaving
+    everything else untouched.
+    """
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return value
 
 
 # Last-resort database path used when no explicit db_path is provided
@@ -312,7 +337,9 @@ async def create_record(db, content_name: str, data: dict, schema: dict = None,
 
     placeholders = ", ".join(["?"] * len(columns))
     col_str = ", ".join(_q(c) for c in columns)
-    values = [d[k] for k in columns]
+    # Issue #5: serialize native list/dict values to JSON text — see
+    # ``_serialize_for_sqlite`` for the contract rationale.
+    values = [_serialize_for_sqlite(d[k]) for k in columns]
 
     try:
         cursor = await db.execute(
@@ -444,7 +471,10 @@ async def update_record(db, content_name: str, id_value, data: dict,
         return {"message": "No fields to update"}
 
     set_clause = ", ".join(f"{_q(k)} = ?" for k in d.keys())
-    values = list(d.values()) + [id_value]
+    # Issue #5: SQLite is the per-runtime serialization boundary —
+    # native list/dict patch values are JSON-encoded here on the way
+    # to aiosqlite's parameter binding (which only accepts primitives).
+    values = [_serialize_for_sqlite(v) for v in d.values()] + [id_value]
 
     try:
         await db.execute(
@@ -553,7 +583,9 @@ async def update_fields(db, content_name: str, record_id, fields: dict) -> None:
     if not fields:
         return
     sets = ", ".join(f"{_q(k)} = ?" for k in fields)
-    vals = list(fields.values()) + [record_id]
+    # Issue #5: serialize native list/dict values to JSON text — see
+    # ``_serialize_for_sqlite`` for the contract rationale.
+    vals = [_serialize_for_sqlite(v) for v in fields.values()] + [record_id]
     await db.execute(f"UPDATE {_q(content_name)} SET {sets} WHERE id = ?", tuple(vals))
     await db.commit()
 
@@ -565,7 +597,9 @@ async def insert_raw(db, content_name: str, data: dict) -> int | None:
         return None
     col_str = ", ".join(_q(c) for c in columns)
     placeholders = ", ".join("?" for _ in columns)
-    vals = [data[k] for k in columns]
+    # Issue #5: serialize native list/dict values to JSON text — see
+    # ``_serialize_for_sqlite`` for the contract rationale.
+    vals = [_serialize_for_sqlite(data[k]) for k in columns]
     cursor = await db.execute(
         f"INSERT INTO {_q(content_name)} ({col_str}) VALUES ({placeholders})",
         tuple(vals))
