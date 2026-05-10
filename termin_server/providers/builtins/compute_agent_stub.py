@@ -51,6 +51,8 @@ from termin_core.providers.compute_contract import (
 )
 from ._provider_hash import hash_provider_config
 
+from termin_server import __version__
+
 
 class StubAgentProvider:
     """Scripted ai-agent for tests.
@@ -225,6 +227,6 @@ def register_stub_agent(
         product_name="stub",
         factory=_stub_agent_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

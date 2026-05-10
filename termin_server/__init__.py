@@ -18,6 +18,17 @@ Usage:
     app = create_termin_app(ir_json_string)
 """
 
-from .app import create_termin_app
+# Canonical package version per docs/version-policy.md §2.1 in
+# termin-compiler. release.py bumps THIS value; everywhere else that
+# needs the package version (provider records, runtime_version
+# reflection, test assertions) imports it from here.
+#
+# IMPORTANT: this assignment must come BEFORE the .app import below.
+# Submodules (routes, providers/builtins/*) do `from . import
+# __version__` at their module-load time; if __version__ isn't yet
+# defined when those imports trigger, Python raises ImportError.
+__version__ = "0.9.3"
 
-__all__ = ["create_termin_app"]
+from .app import create_termin_app  # noqa: E402 — see __version__ note
+
+__all__ = ["create_termin_app", "__version__"]

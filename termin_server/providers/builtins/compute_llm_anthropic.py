@@ -41,6 +41,8 @@ from termin_core.providers.compute_contract import (
 )
 from ._provider_hash import hash_provider_config
 
+from termin_server import __version__
+
 
 class AnthropicLlmProvider:
     """Single-shot Anthropic completion.
@@ -282,6 +284,6 @@ def register_anthropic_llm(
         product_name="anthropic",
         factory=_anthropic_llm_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

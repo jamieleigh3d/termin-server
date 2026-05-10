@@ -46,6 +46,7 @@ import aiosqlite
 from termin_core.providers import storage_contract as sc
 from termin_core.providers.contracts import Category, ContractRegistry
 from termin_server import storage as _storage
+from termin_server import __version__
 
 
 class SqliteStorageProvider:
@@ -1140,6 +1141,6 @@ def register_sqlite_storage(
         product_name="sqlite",
         factory=_sqlite_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

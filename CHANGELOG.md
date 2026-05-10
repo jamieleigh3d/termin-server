@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`termin_server.__version__`** is now declared in
+  ``termin_server/__init__.py`` (was missing pre-v0.9.4). All
+  in-package callers that need the package version
+  (``runtime_version`` reflection in ``routes.py``, the
+  ``version=`` kwarg on every built-in provider's
+  ``ProviderRecord`` registration, test assertions on
+  ``runtime_version`` / ``provider.version``) now import this
+  single canonical value instead of hardcoding the literal. Per
+  ``termin-compiler/docs/version-policy.md`` §2.1: the package
+  version has exactly one source of truth and everything else
+  imports.
+
+### Changed
+
+- **`runtime_version` reflection** (``routes.py:943``) reads
+  from ``termin_server.__version__`` instead of the hardcoded
+  ``"0.9.2"`` literal. v0.9.3 shipped with the literal lagging the
+  package version (the live server reported ``0.9.2`` while the
+  installed package was ``0.9.3``); the import-from-canonical
+  pattern makes the value automatically track the package on
+  every release.
+- **All eleven built-in providers** under
+  ``termin_server/providers/builtins/`` (``compute_default_cel``,
+  ``compute_llm_anthropic`` / ``_stub``, ``compute_agent_anthropic``
+  / ``_stub``, ``identity_stub``, ``channel_webhook_stub`` /
+  ``_messaging_stub`` / ``_email_stub``, ``presentation_tailwind_default``,
+  ``storage_sqlite``) read ``version=__version__`` from
+  ``termin_server`` instead of hardcoding the literal. Same
+  drift-correction motivation as ``runtime_version`` above.
+- **Test pin in ``test_integration.py::test_runtime_registry_returns_json``**
+  now asserts against the imported ``__version__`` rather than a
+  literal so the test moves with the package without requiring a
+  release-time bump.
+
+### Compatibility
+
+- Wire-shape unchanged. Pre-fix: live server reported
+  ``runtime_version="0.9.2"`` and registered providers with
+  ``version="0.9.2"``. Post-fix: both report ``"0.9.3"`` (the
+  current package version). Consumers that pinned to ``"0.9.2"``
+  on the wire will need to update their expectations — this is
+  the *correction* of the v0.9.3 ship drift, not a new
+  contract change.
+- New companion doc at
+  ``termin-compiler/docs/version-policy.md`` enumerates the
+  source-of-truth conventions for both version tracks (package
+  vs IR). ``release.py`` now matches the policy.
+
 ### Fixed
 
 - **SQLite is now the per-runtime serialization boundary for

@@ -28,6 +28,8 @@ from termin_core.providers.channel_contract import (
     MessagingChannelProvider, _StubSubscription, _now_iso,
 )
 
+from termin_server import __version__
+
 
 class MessagingChannelStub:
     """Stub messaging provider — records sends and supports inbound injection.
@@ -208,7 +210,7 @@ def register_messaging_stub(
         product_name="stub",
         factory=_messaging_stub_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         features=["send", "update", "react", "subscribe"],
         contract_registry=contract_registry,
     )

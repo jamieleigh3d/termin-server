@@ -29,6 +29,8 @@ from termin_core.providers.channel_contract import (
     _now_iso,
 )
 
+from termin_server import __version__
+
 
 @dataclass
 class CapturedEmail:
@@ -128,7 +130,7 @@ def register_email_stub(
         product_name="stub",
         factory=_email_stub_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         features=["send"],
         contract_registry=contract_registry,
     )

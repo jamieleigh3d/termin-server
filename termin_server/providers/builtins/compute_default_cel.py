@@ -26,6 +26,8 @@ from typing import Any, Mapping
 
 from termin_core.providers.contracts import Category, ContractRegistry
 
+from termin_server import __version__
+
 
 class DefaultCelProvider:
     """Pure CEL evaluation. Synchronous, deterministic.
@@ -91,6 +93,6 @@ def register_default_cel(
         product_name="default-cel",
         factory=_default_cel_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

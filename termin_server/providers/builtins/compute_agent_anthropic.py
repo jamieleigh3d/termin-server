@@ -38,6 +38,8 @@ from termin_core.providers.compute_contract import (
 )
 from ._provider_hash import hash_provider_config
 
+from termin_server import __version__
+
 
 # Always-available tools that the runtime gate honors regardless of
 # source-level grants — see compute_contract.ToolSurface.always_available.
@@ -422,6 +424,6 @@ def register_anthropic_agent(
         product_name="anthropic",
         factory=_anthropic_agent_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

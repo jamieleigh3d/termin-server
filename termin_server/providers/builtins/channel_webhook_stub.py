@@ -28,6 +28,8 @@ from termin_core.providers.channel_contract import (
     _now_iso,
 )
 
+from termin_server import __version__
+
 
 class WebhookChannelStub:
     """Stub webhook provider — records sends without making HTTP calls.
@@ -110,7 +112,7 @@ def register_webhook_stub(
         product_name="stub",
         factory=_webhook_stub_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         features=["send"],
         contract_registry=contract_registry,
     )

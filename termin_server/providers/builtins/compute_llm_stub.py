@@ -44,6 +44,8 @@ from termin_core.providers.compute_contract import (
 )
 from ._provider_hash import hash_provider_config
 
+from termin_server import __version__
+
 
 class StubLlmProvider:
     """Scripted LLM completions for tests.
@@ -123,6 +125,6 @@ def register_stub_llm(
         product_name="stub",
         factory=_stub_llm_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )

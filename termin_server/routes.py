@@ -17,6 +17,7 @@ from fastapi import Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pathlib import Path
 
+from . import __version__
 from .context import RuntimeContext
 from .storage import (
     get_db, create_record, get_record, update_record, delete_record,
@@ -940,7 +941,10 @@ def register_runtime_endpoints(app, ctx: RuntimeContext):
             },
         }
         return {
-            "runtime_version": "0.9.2",
+            # Source-of-truth: termin_server.__version__. Per
+            # docs/version-policy.md §2.1, runtime_version reports
+            # the package version of the runtime serving the app.
+            "runtime_version": __version__,
             "application": ctx.ir.get("name", "Termin App"),
             "boundaries": boundaries,
             "protocols": {"realtime": "websocket", "reliable": "rest"},

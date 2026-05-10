@@ -37,6 +37,8 @@ from termin_core.providers.presentation_contract import (
     register_presentation_base_contracts,
 )
 
+from termin_server import __version__
+
 
 class TailwindDefaultProvider:
     """The reference SSR-only Tailwind renderer.
@@ -158,6 +160,6 @@ def register_tailwind_default(
             product_name="tailwind-default",
             factory=_tailwind_default_factory,
             conformance="passing",
-            version="0.9.2",
+            version=__version__,
             contract_registry=contract_registry,
         )

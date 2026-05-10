@@ -31,6 +31,8 @@ from typing import Any, Mapping
 from termin_core.providers.contracts import Category, ContractRegistry
 from termin_core.providers.identity_contract import Principal
 
+from termin_server import __version__
+
 
 class StubIdentityProvider:
     """Cookie-style identity for dev / test.
@@ -127,6 +129,6 @@ def register_stub_identity(
         product_name="stub",
         factory=_stub_factory,
         conformance="passing",
-        version="0.9.2",
+        version=__version__,
         contract_registry=contract_registry,
     )
