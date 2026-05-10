@@ -891,6 +891,59 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                                         appended_entry=appended_entry,
                                         invoked_by_principal_id=invoked_by_principal_id,
                                     )
+                                elif action.get("update_content"):
+                                    # v0.9.4 Gap #5: Update action.
+                                    # Evaluate each (column, cel_expr)
+                                    # assignment against the predicate
+                                    # context (`evctx`) and apply the
+                                    # patch via storage.update on the
+                                    # parent record. Targets the same
+                                    # record the When-rule fired on
+                                    # (sourced from `record["id"]`,
+                                    # mirroring the Append action's
+                                    # parent-record resolution path).
+                                    # CEL eval failures fail loud in
+                                    # the log — the upstream HTTP/WS
+                                    # request that triggered the rule
+                                    # has already returned by the time
+                                    # event dispatch runs.
+                                    target_id = record.get("id")
+                                    if not target_id:
+                                        print(
+                                            f"[Termin] [WARN] When-rule "
+                                            f"Update: parent record "
+                                            f"missing id; skipping. "
+                                            f"content={action.get('update_content')!r}"
+                                        )
+                                        continue
+                                    patch = {}
+                                    update_failed = False
+                                    for col, cel_expr in action.get(
+                                        "update_assignments") or ():
+                                        try:
+                                            patch[col] = ctx.expr_eval.evaluate(
+                                                cel_expr, evctx)
+                                        except Exception as _eval_err:
+                                            print(
+                                                f"[Termin] [WARN] When-rule "
+                                                f"Update CEL eval failed for "
+                                                f"{col!r}: {_eval_err}"
+                                            )
+                                            update_failed = True
+                                            break
+                                    if update_failed or not patch:
+                                        continue
+                                    try:
+                                        await ctx.storage.update(
+                                            action["update_content"],
+                                            target_id, patch,
+                                        )
+                                    except Exception as _upd_err:
+                                        print(
+                                            f"[Termin] [WARN] When-rule "
+                                            f"Update storage.update failed: "
+                                            f"{_upd_err}"
+                                        )
                                 elif action.get("column_mapping"):
                                     insert_data = {
                                         p[0]: record.get(p[1], "")

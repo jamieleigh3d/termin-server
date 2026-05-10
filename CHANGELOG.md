@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (v0.9.4 slice A3a — runtime executor for the When-rule Update action)
+
+- **When-rule action dispatcher gains an Update branch.** When
+  an action's `update_content` field is non-empty, the runtime:
+  1. Reads the parent record id from the event context's `record["id"]`
+     (mirrors the Append action's parent-record resolution).
+  2. Evaluates each `(column, cel_expression)` assignment against
+     the predicate context (`evctx` — same context the rule's
+     trigger condition saw, so `appended_entry`,
+     `<singular>.<field>` aliases, `the_user`, `now` all
+     resolve).
+  3. Applies the assembled patch via `ctx.storage.update(target,
+     id, patch)`.
+
+  CEL-eval failures fail loud in the log (matches the Append
+  action's failure mode) — the upstream HTTP/WS request that
+  triggered the rule has already returned by the time event
+  dispatch runs, so there's no surface to propagate errors to
+  the caller. Storage failures also fail loud and skip the
+  remaining actions in the rule's body.
+
+- **2 new integration tests** in
+  `tests/test_integration.py::TestWhenRuleUpdateAction` covering:
+  - Single-fire: a fresh session with `fired=no` → first user
+    append fires the rule → Append + Update both run → record
+    state is `fired=yes`, conversation has user + system_event
+    entries.
+  - Single-shot: subsequent user appends after the flag flips
+    don't re-fire (the rule's predicate gates on `fired != "yes"`).
+    End state has 4 entries (3 user + 1 system_event), not 5.
+
+  Total termin-server tests: 113 → 115. All green.
+
+### Fixed (v0.9.4 — bootstrap.py shape-aware transition gate read)
+
+- **`bootstrap.py::_visible_actions_for_row`** flattens the
+  v0.9.4 dict-shape transition gate
+  (`{required_scope, condition_expr}`) back to a bare scope
+  string for the action-button visibility check. Previously
+  raised `TypeError: unhashable type: 'dict'` when the page
+  template tried to resolve action-button visibility against a
+  state machine whose transitions had been upgraded to the dict
+  shape via the Path C / Gap #3 work. Forward-compat: legacy
+  bare-string values still work via the `isinstance` check.
+
+  Caught by the compiler suite regression `test_role_restricted_page_serves_shell_to_anonymous_user`
+  which compiles + boots a real app and exercises the page-route
+  visibility path.
+
 ### Added (v0.9.4 slice A3a — runtime wiring for CEL-condition state transitions)
 
 - **`sm_lookup` transition value shape extended to a dict**

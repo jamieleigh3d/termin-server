@@ -325,7 +325,16 @@ def _visible_actions_for_row(
             key = (current_state, target)
             if key not in transitions:
                 continue
-            req = transitions.get(key) or ""
+            # v0.9.4 Gap #3: transition values are now dicts
+            # ({required_scope, condition_expr}) instead of bare scope
+            # strings. Flatten via the same shape-aware helper used by
+            # pages.py + routes.py. Forward-compat: legacy bare-string
+            # values still work via the isinstance check.
+            gate = transitions.get(key)
+            if isinstance(gate, dict):
+                req = gate.get("required_scope") or ""
+            else:
+                req = gate or ""
             if not req or req in user_scopes:
                 visible.append(label)
             continue

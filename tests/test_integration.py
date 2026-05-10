@@ -1280,3 +1280,144 @@ class TestChatConversationFieldEndToEnd:
         )
         assert len(entries) == 1
         assert entries[0]["body"] == "hello L9"
+
+
+
+class TestWhenRuleUpdateAction:
+    """v0.9.4 Gap #5 (Airlock-on-Termin slice A3a): When-rule
+    bodies may use `Update <content>: <field> = `<cel-expression>``
+    to write a patch to the same parent record the rule fired on.
+
+    Surfaced by Airlock OVERSEER's once-per-session flag flips —
+    without an Update verb, OVERSEER would re-fire on every
+    subsequent player append. The Update action targets the same
+    parent record (sourced from `record["id"]`, mirroring the
+    Append action's resolution path).
+
+    Pattern under test (mirrors the OVERSEER #1 rule from
+    examples-dev/airlock.termin):
+
+      When `appended_entry.kind == "user" && !session.fired`:
+        Append to sessions.conversation as "system_event" with body `"hello"`
+        Update sessions: fired = `true`
+    """
+
+    _SOURCE = '''Application: When Rule Update Action Test
+  Description: v0.9.4 Gap #5 fixture — single-shot via Update
+Id: 8e2b3a2c-4f9d-4e1a-b3c5-1d2e8f4a9c30
+
+Identity:
+  Scopes are "play"
+  An "anonymous" has "play"
+
+Content called "sessions":
+  Each session has a name which is text, default "Session"
+  Each session has fired which is yes or no, defaults to "no"
+  Each session has a conversation which is conversation
+  Anyone with "play" can view sessions
+  Anyone with "play" can update sessions
+  Anyone with "play" can create sessions
+  Anyone with "play" can append to sessions.conversation
+
+When `appended_entry.kind == "user" && session.fired != "yes"`:
+  Append to sessions.conversation as "system_event" with body `"single-shot fired"`
+  Update sessions: fired = `"yes"`
+
+As anonymous, I want a chat:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def client(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "when_rule_update.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as c:
+            yield c
+
+    def _read_record(self, client, session_id):
+        get = client.get(f"/api/v1/sessions/{session_id}")
+        assert get.status_code == 200, get.text
+        return get.json()
+
+    def _read_entries(self, client, session_id):
+        rec = self._read_record(client, session_id)
+        raw = rec.get("conversation")
+        return json.loads(raw) if isinstance(raw, str) else (raw or [])
+
+    def test_update_action_flips_field_on_first_fire(self, client):
+        """Given a fresh session with `fired=no`, the first user
+        append fires the rule → Append + Update both run → the
+        session record's `fired` field is now `yes`."""
+        create = client.post(
+            "/api/v1/sessions", json={"name": "first-fire test"})
+        assert create.status_code in (200, 201), create.text
+        session_id = create.json()["id"]
+
+        # Pre-state
+        rec = self._read_record(client, session_id)
+        assert rec.get("fired") == "no", f"pre-state expected 'no'; got {rec}"
+
+        # Append a user message → triggers the rule
+        ap = client.post(
+            f"/api/v1/sessions/{session_id}/conversation:append",
+            json={"kind": "user", "body": "ping"})
+        assert ap.status_code == 201, ap.text
+
+        # Post-state: Update flipped fired to true
+        rec = self._read_record(client, session_id)
+        assert rec.get("fired") == "yes", (
+            f"Update action did not flip fired; got rec={rec}"
+        )
+
+        # Append also ran — system_event entry present
+        entries = self._read_entries(client, session_id)
+        assert len(entries) == 2
+        assert entries[1]["kind"] == "system_event"
+        assert entries[1]["body"] == "single-shot fired"
+
+    def test_update_action_single_shots_subsequent_appends(self, client):
+        """After fired flips to yes, the rule's predicate
+        (`!session.fired`) returns false on subsequent user
+        appends, so no further system_event entries land. End
+        state: 4 entries (2 user + 1 system_event from first
+        fire + 1 user from the second), NOT 5 (which would
+        indicate the rule re-fired)."""
+        create = client.post(
+            "/api/v1/sessions", json={"name": "single-shot test"})
+        session_id = create.json()["id"]
+
+        # First user append → rule fires
+        client.post(
+            f"/api/v1/sessions/{session_id}/conversation:append",
+            json={"kind": "user", "body": "first"})
+        # Second user append → predicate is now false (fired=yes),
+        # rule should NOT re-fire
+        client.post(
+            f"/api/v1/sessions/{session_id}/conversation:append",
+            json={"kind": "user", "body": "second"})
+        # Third user append → also should not re-fire
+        client.post(
+            f"/api/v1/sessions/{session_id}/conversation:append",
+            json={"kind": "user", "body": "third"})
+
+        entries = self._read_entries(client, session_id)
+        # Expected: user, system_event, user, user
+        kinds = [e["kind"] for e in entries]
+        assert kinds == ["user", "system_event", "user", "user"], (
+            f"rule should single-shot — got entry kinds {kinds}"
+        )
