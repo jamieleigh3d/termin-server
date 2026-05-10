@@ -207,137 +207,30 @@ def _populate_presentation_providers(
 ) -> None:
     """Populate `ctx.presentation_providers` from deploy_config bindings.
 
-    Deploy-config bindings come in two shapes:
+    The actual binding-resolution logic lives in
+    ``termin_core.presentation.provider_bindings`` (v0.9.4 Path C
+    refactor — alt runtimes inherit it). This function is a thin
+    wrapper that adapts the core helper to the server's ctx
+    convention: read the contract-package registry off ctx, call
+    the core resolver, append the resulting triples to
+    ``ctx.presentation_providers``.
 
-      bindings.presentation.<contract>:        # per-contract
-        provider: "<product>"
-        config: {...}
-
-      presentation.bindings.<namespace-or-contract>:    # per-namespace
-        provider: "<product>"
-        config: {...}
-
-    Either is accepted. Namespace bindings (e.g. `presentation-base`)
-    expand to all contracts in that namespace; per-contract bindings
-    target one. Sub-contract bindings win over namespace bindings
-    when both apply (BRD #2 §11.3).
-
-    The function caches one provider instance per product across
-    contracts — calling the factory ten times with the same config
-    would create ten redundant instances.
+    The ``contract_registry`` argument is unused at present (the
+    core resolver doesn't consult it); kept in the signature for
+    backward compatibility with existing callers and as a hook
+    point for future deploy-time validation.
     """
-    from termin_core.providers.contracts import Category
-    from termin_core.providers.presentation_contract import (
-        PRESENTATION_BASE_CONTRACTS,
+    from termin_core.presentation.provider_bindings import (
+        build_presentation_provider_bindings,
     )
 
-    # Two locations where bindings might live, see BRD §11.2.
-    flat = (deploy_config.get("bindings", {}) or {}).get("presentation", {})
-    nested = (deploy_config.get("presentation", {}) or {}).get("bindings", {})
-    bindings = {**(nested or {}), **(flat or {})}
-
-    # v0.9 Phase 5b.3: when no explicit binding exists for the
-    # presentation-base namespace, synthesize one to tailwind-default
-    # so the dispatch table is symmetric with the explicit-binding
-    # case. The legacy SSR Jinja path still drives actual page
-    # rendering — but downstream consumers (`page_should_use_shell`,
-    # the bundle-discovery endpoint, conformance manifests) read
-    # `ctx.presentation_providers` and benefit from a uniform shape
-    # whether or not the deploy config names a provider.
-    has_base_binding = (
-        "presentation-base" in bindings
-        or any(k.startswith("presentation-base.") for k in bindings)
+    triples = build_presentation_provider_bindings(
+        deploy_config=deploy_config or {},
+        provider_registry=provider_registry,
+        contract_package_registry=getattr(
+            ctx, "contract_package_registry", None),
     )
-    if not has_base_binding:
-        bindings = {
-            **bindings,
-            "presentation-base": {"provider": "tailwind-default", "config": {}},
-        }
-    if not bindings:
-        return
-
-    instances: dict = {}  # product_name -> instance, cached across contracts
-
-    def _get_or_create(product: str, config: dict):
-        if product not in instances:
-            # Factory lookup: any registered (PRESENTATION, *, product)
-            # record's factory will do — they all wrap the same product.
-            for record in provider_registry.all_records():
-                if (record.category == Category.PRESENTATION
-                        and record.product_name == product):
-                    instances[product] = record.factory(config or {})
-                    break
-        return instances.get(product)
-
-    # Per-contract bindings first, then namespace fallback.
-    # v0.9 Phase 5c.3: namespace expansion consults the contract-
-    # package registry when the namespace isn't presentation-base.
-    # This lets `bindings.presentation.airlock-components` map a
-    # provider product to all contracts declared by the
-    # airlock-components contract package, exactly the way
-    # presentation-base namespace bindings already work.
-    #
-    # v0.9.4 Path C: when neither presentation-base nor a contract-
-    # package YAML covers the namespace, fall back to the bound
-    # provider's own `declared_contracts`. This makes a per-provider
-    # package (the Airlock-on-Termin shape) deployable with a single
-    # `bindings.presentation.<namespace>: {provider: <product>}`
-    # line — no contract-package YAML required for the simple case
-    # where one provider owns one namespace exhaustively.
-    pkg_registry = getattr(ctx, "contract_package_registry", None)
-    contract_bindings: dict[str, dict] = {}
-    for key, binding in bindings.items():
-        if not isinstance(binding, dict):
-            continue
-        if "." in key:
-            contract_bindings[key] = binding
-            continue
-        # Namespace binding.
-        full_names: tuple[str, ...] = ()
-        if key == "presentation-base":
-            full_names = tuple(
-                f"presentation-base.{s}" for s in PRESENTATION_BASE_CONTRACTS
-            )
-        elif pkg_registry is not None and key in pkg_registry.namespaces():
-            # Look up the contracts declared by this package and
-            # fan the binding out to each. The registry's
-            # `get_contract` API is by full name; iterate the
-            # private packages map to enumerate all contracts in
-            # the namespace.
-            pkg = pkg_registry._packages.get(key)
-            if pkg:
-                full_names = tuple(f"{key}.{c.name}" for c in pkg.contracts)
-        else:
-            # v0.9.4 Path C fallback: instantiate the provider and
-            # ask which contracts it declares in this namespace.
-            # The instance is cached in `instances` so the later
-            # materialization loop doesn't re-build it. Quietly
-            # skip if the product isn't registered or the provider
-            # has no `declared_contracts` — deploy-time validation
-            # (BRD #2 §8.5 required_contracts) is the right place
-            # to fail-closed; this populator stays advisory.
-            product = binding.get("provider")
-            instance = (
-                _get_or_create(product, binding.get("config") or {})
-                if product else None
-            )
-            if instance is not None:
-                declared = getattr(instance, "declared_contracts", ()) or ()
-                prefix = f"{key}."
-                full_names = tuple(c for c in declared if c.startswith(prefix))
-        for full in full_names:
-            contract_bindings.setdefault(full, binding)
-
-    # Materialize: one (contract, product, instance) triple per
-    # bound contract. Skip products that have no registered factory.
-    for contract, binding in contract_bindings.items():
-        product = binding.get("provider")
-        if not product:
-            continue
-        instance = _get_or_create(product, binding.get("config") or {})
-        if instance is None:
-            continue
-        ctx.presentation_providers.append((contract, product, instance))
+    ctx.presentation_providers.extend(triples)
 
 
 def _load_contract_packages(ctx, deploy_config: dict) -> None:

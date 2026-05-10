@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added (Path C — per-component contract dispatch in the SSR pipeline)
+### Added (v0.9.4 Path C — per-component contract dispatch in the SSR pipeline)
 
 - **`render_component(node, presentation_providers=None)` now
   dispatches by `node["contract"]` first, falling back to the
@@ -19,22 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   render time and the type-default renderer (e.g.
   `_render_data_table`) handled the node. Post-Path-C the SSR
   pipeline looks up the bound provider in the new
-  `presentation_providers` argument and routes:
-  - SSR-capable provider (declares `"ssr"` in `render_modes`):
-    call `provider.render_ssr(contract, node, {}, {})` and
-    inline the returned markup.
-  - CSR-only provider: emit a mount-point `<div>` carrying
-    the qualified contract name (`data-termin-contract`) and
-    the IR fragment as HTML-escaped JSON (`data-termin-ir`).
-    The new `hydrateCsrMounts()` JS sweep parses the IR back,
-    calls the registered renderer, and tags the element
-    `data-termin-hydrated` so re-runs are idempotent.
+  `presentation_providers` argument and routes via the new
+  ``termin_core.presentation.dispatch`` helpers:
+  - SSR-capable provider: ``render_via_provider`` calls
+    ``render_ssr(contract, node, {}, {})`` and inlines the
+    returned markup.
+  - CSR-only provider: ``render_via_provider`` emits a mount-point
+    ``<div>`` carrying the qualified contract name and the IR
+    fragment as HTML-escaped JSON. The new ``hydrateCsrMounts()``
+    JS sweep parses the IR back, calls the registered renderer,
+    and tags the element hydrated so re-runs are idempotent.
 
-  Falls through to type dispatch when the contract isn't bound
-  — defensive, since the populator may have skipped a
-  misconfigured binding. Provider exceptions are caught and
-  rendered as visible markup so failures show in the browser
-  rather than silently corrupting the page.
+  Falls through to the server's type-based RENDERERS table when
+  the contract isn't bound — defensive, since the populator may
+  have skipped a misconfigured binding.
 
 - **`build_page_template` and `build_merged_page_template` now
   accept `presentation_providers=None`** and thread the value
@@ -43,21 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in. Old-shape callers (no kwarg) keep working — they just
   don't get contract dispatch, which is the legacy behavior.
 
-- **`_populate_presentation_providers` learned a third
-  namespace-expansion fallback.** Pre-Path-C, namespace
-  bindings (`bindings.presentation.<key>`) only expanded when
-  `key == "presentation-base"` (hardcoded list) or
-  `key in pkg_registry.namespaces()` (a contract-package YAML).
-  Custom-namespace bindings without a contract package
-  (`bindings.presentation.airlock: {provider: airlock}`) got
-  silently dropped — `ctx.presentation_providers` never saw
-  the contracts. Path C adds: when neither path matches,
-  instantiate the provider, read its `declared_contracts`,
-  and bind each contract whose name starts with `<key>.`.
-  Makes a per-provider package (the Airlock-on-Termin shape)
-  deployable with one binding line, no contract-package YAML
-  required for the simple case where one provider owns one
-  namespace exhaustively.
+- **`_populate_presentation_providers` is now a thin wrapper**
+  over ``termin_core.presentation.provider_bindings.build_presentation_provider_bindings``.
+  All the binding-resolution logic — including the namespace-
+  expansion fallback that asks a provider's ``declared_contracts``
+  — moved to core in this slice so alt runtimes inherit it. The
+  function reads the contract-package registry off ``ctx``,
+  calls the core resolver, and appends the result to
+  ``ctx.presentation_providers``.
 
 - **`hydrateCsrMounts()` in `static/termin.js`.** Walks
   `[data-termin-csr-mount][data-termin-contract]:not([data-termin-hydrated])`
@@ -67,27 +58,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls the registered renderer with `(mountPoint, irFragment)`,
   marks the node hydrated. Idempotent. Missing renderer
   surfaces as a console warning rather than silent failure.
-  Tested in production via the `airlock-smoke-runtime` launch
-  entry: cosmic-orb mount point hydrates into the expected
-  CosmicOrb SVG (verified via accessibility-tree snapshot
-  showing the SVG's aria-label).
+  The four data-attribute names duplicate the core constants
+  in ``termin_core.presentation.dispatch`` (CSR_MOUNT_ATTR,
+  CSR_CONTRACT_ATTR, CSR_IR_ATTR, CSR_HYDRATED_ATTR) because JS
+  doesn't import Python — the JS comment points at the core
+  source of truth and asks maintainers to keep the two in
+  lock-step. Tested in production via the
+  `airlock-smoke-runtime` launch entry: cosmic-orb mount point
+  hydrates into the expected CosmicOrb SVG (verified via
+  accessibility-tree snapshot showing the SVG's aria-label
+  ``"Orbital airlock viewport looking onto a planet"``).
 
-- **`tests/test_path_c_dispatch.py` — 11 new unit tests** covering:
-  - Namespace-expansion fallback: unknown namespace expands via
-    `declared_contracts`; cross-namespace contracts on the same
-    provider don't leak; per-contract bindings still work.
-  - `render_component` contract dispatch: no-contract falls back
-    to type dispatch, unbound contract falls back, CSR-only
-    emits mount point with proper data-attrs, IR round-trips
-    through HTML escaping (quotes + ampersands), SSR-capable
-    inlines provider output, exact-match prevents partial-name
-    collisions.
-  - `build_page_template` + `build_merged_page_template` thread
-    providers through to `render_component`.
+- **`tests/test_path_c_dispatch.py` — 11 unit tests** covering
+  the integration through ``render_component``,
+  ``build_page_template``, ``build_merged_page_template``, and
+  ``_populate_presentation_providers``. The unit-level tests
+  for the core helpers themselves live in termin-core's own
+  suite (see termin-core CHANGELOG; 27 new tests there).
 
   Total Python tests: 102 → 113. All green.
 
-### Notes (Path C — what this unblocks)
+### Notes (Path C — what this unblocks + design framing)
+
+- **Layering note.** This slice originally landed entirely in
+  termin-server. JL's review caught the layering — the framework-
+  free pieces (provider lookup, dispatch decision, mount-point
+  HTML emission, namespace-binding resolution) belong in
+  termin-core so alt runtimes inherit them, per the v0.9.3 arc.
+  The current slice splits accordingly: framework-free helpers
+  are in ``termin_core.presentation.dispatch`` and
+  ``termin_core.presentation.provider_bindings``; termin-server's
+  ``render_component`` and ``_populate_presentation_providers``
+  are thin wrappers. The Jinja2-bound template builders
+  (``build_page_template`` / ``build_merged_page_template``) and
+  the type-based RENDERERS table stay in termin-server because
+  they're tied to the server's specific templating engine and
+  built-in tailwind-default renderer table.
 
 - Airlock-on-Termin can now render through the actual runtime.
   The v0.9.4 Path B work in
@@ -107,8 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into v0.9.4 to unblock the Airlock port. The implementation
   is additive — old-shape `render_component(node)` calls keep
   working — so the roadmap row's "deferred to v0.10" framing
-  was over-cautious. The actual surface is ~150 lines + 11
-  tests, not the rewrite the row implied.
+  was over-cautious.
 
 - Per-component override DOES NOT yet support mixed providers
   on the same page (Tailwind-rendered table next to a Spectrum

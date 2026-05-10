@@ -1036,94 +1036,25 @@ RENDERERS = {
 # compiler lowers it onto `node["contract"]`. The legacy SSR pipeline
 # dispatched only on `node["type"]`, so the override silently dropped
 # at render time and the page rendered through the type-default
-# renderer (e.g. tailwind-default `_render_data_table`). This is the
-# 5b.3 cut-over the roadmap deferred — pulled forward in v0.9.4 to
-# unblock the Airlock-on-Termin port.
+# renderer (e.g. tailwind-default `_render_data_table`).
 #
-# Two cases for a bound provider:
+# Path C introduces a contract-first dispatch branch in
+# `render_component`: when the bound provider for the contract is
+# SSR-capable, call its `render_ssr` and inline the result; when it's
+# CSR-only, emit a mount-point div the JS hydrator
+# (`hydrateCsrMounts` in static/termin.js) picks up after the
+# provider bundle loads.
 #
-#   * SSR-capable: the provider implements `render_ssr`, so we call
-#     it and inline the returned markup directly into the page
-#     template. No client-side hydration step required.
-#
-#   * CSR-only (the Airlock case, mirroring Spectrum's chat-component
-#     pattern): the provider can't render server-side. We emit a
-#     mount-point div with the IR fragment serialized into a data
-#     attribute; termin.js's `hydrateCsrMounts` walks these post-
-#     bundle-load and calls `getRenderer(contract)` to mount the
-#     React tree.
-#
-# The lookup is exact-match on the qualified contract name. A typo
-# in `Using` falls through to type dispatch, which is the right
-# behavior — the type-based renderer is always a safe default.
+# The actual lookup + dispatch helpers live in
+# `termin_core.presentation.dispatch` (framework-free, alt runtimes
+# inherit them). termin-server's `render_component` is now a thin
+# wrapper that calls the core helper first and falls back to the
+# server-specific RENDERERS table when no contract is bound.
 
-def _find_provider_for_contract(presentation_providers, contract: str):
-    """Linear search for a provider bound to the exact contract name.
-
-    Returns the provider instance or None. The list is small (one
-    entry per bound contract — six for Airlock, ten for Tailwind);
-    a dict index would be premature optimization."""
-    if not presentation_providers or not contract:
-        return None
-    for c, _product, provider in presentation_providers:
-        if c == contract:
-            return provider
-    return None
-
-
-def _render_via_provider(node: dict, contract: str, provider) -> str:
-    """Dispatch a node to its bound provider.
-
-    SSR-capable provider: call `render_ssr` with empty data /
-    principal context (the SSR Jinja path supplies its own data
-    via template context, not via the provider Protocol). The
-    provider's exception bubbles up framed as visible markup so
-    the failure is easy to spot in the browser rather than silent.
-
-    CSR-only provider: emit a mount-point div carrying the IR
-    fragment as an HTML-escaped JSON attribute. termin.js parses
-    it back at hydration time."""
-    import html
-    import json as _json
-
-    modes = tuple(getattr(provider, "render_modes", ()) or ())
-    if "ssr" in modes:
-        try:
-            # Pass empty data / principal_context — the existing SSR
-            # pipeline binds data via Jinja template context, not via
-            # the Protocol's `PresentationData`. SSR-capable custom
-            # providers either render purely from `ir_fragment` props
-            # (the common case) or document their need for richer
-            # data plumbing (a v0.10 follow-up if it shows up).
-            return provider.render_ssr(contract, node, {}, {})
-        except NotImplementedError:
-            # Provider declared SSR support but didn't implement it.
-            # Fall through to the CSR mount-point path below as a
-            # safety net rather than crashing the page render.
-            pass
-        except Exception as exc:
-            return (
-                f'<div class="text-red-600 text-sm" '
-                f'data-termin-provider-error="{html.escape(contract)}">'
-                f'[provider {html.escape(contract)} render_ssr failed: '
-                f'{type(exc).__name__}: {html.escape(str(exc))}]'
-                f'</div>'
-            )
-    if "csr" in modes:
-        ir_attr = html.escape(_json.dumps(node), quote=True)
-        return (
-            f'<div data-termin-csr-mount '
-            f'data-termin-contract="{html.escape(contract)}" '
-            f'data-termin-ir="{ir_attr}"></div>'
-        )
-    # Provider declared no render modes — render a debug marker so
-    # the misconfiguration is visible.
-    return (
-        f'<div class="text-yellow-700 text-sm" '
-        f'data-termin-provider-empty-modes="{html.escape(contract)}">'
-        f'[provider {html.escape(contract)} declares no render_modes]'
-        f'</div>'
-    )
+from termin_core.presentation.dispatch import (
+    find_provider_for_contract,
+    render_via_provider,
+)
 
 
 def render_component(node: dict, presentation_providers=None) -> str:
@@ -1132,8 +1063,9 @@ def render_component(node: dict, presentation_providers=None) -> str:
     Dispatch order (v0.9.4 Path C):
 
       1. If `node["contract"]` names a bound provider in
-         `presentation_providers`, dispatch via that provider
-         (`_render_via_provider`). Custom-namespace contracts
+         `presentation_providers`, dispatch via the core helpers
+         (``find_provider_for_contract`` +
+         ``render_via_provider``). Custom-namespace contracts
          like `airlock.cosmic-orb` reach their registered provider
          here.
 
@@ -1149,10 +1081,10 @@ def render_component(node: dict, presentation_providers=None) -> str:
     """
     contract = node.get("contract")
     if contract:
-        provider = _find_provider_for_contract(
+        provider = find_provider_for_contract(
             presentation_providers, contract)
         if provider is not None:
-            return _render_via_provider(node, contract, provider)
+            return render_via_provider(node, contract, provider)
     renderer = RENDERERS.get(node.get("type", ""), _render_unknown)
     return renderer(node)
 

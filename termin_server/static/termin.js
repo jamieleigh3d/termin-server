@@ -1728,11 +1728,20 @@ async function loadCsrBundles() {
 // v0.9.4 Path C: per-component CSR mount-point hydrator.
 //
 // Walks every `[data-termin-csr-mount][data-termin-contract]`
-// element the SSR pipeline emitted (presentation.py
-// `_render_via_provider` for CSR-only providers). For each one,
-// looks up the registered renderer for the contract name and calls
-// it with `(mountPoint, irFragment)`. The IR fragment is parsed
-// from the `data-termin-ir` attribute (HTML-escaped JSON).
+// element the SSR pipeline emitted. The four data attribute names
+// (data-termin-csr-mount, data-termin-contract, data-termin-ir,
+// data-termin-hydrated) are part of the runtime contract — they
+// are defined as constants in `termin_core.presentation.dispatch`
+// (CSR_MOUNT_ATTR, CSR_CONTRACT_ATTR, CSR_IR_ATTR, CSR_HYDRATED_ATTR)
+// so any conforming runtime emits the same names and any provider
+// bundle's renderer can rely on them. The string literals here
+// duplicate the core constants because JS doesn't import Python;
+// keep the two in lock-step.
+//
+// For each mount-point, looks up the registered renderer for the
+// contract name and calls it with `(mountPoint, irFragment)`. The
+// IR fragment is parsed from the `data-termin-ir` attribute
+// (HTML-escaped JSON).
 //
 // Idempotent: marks each mount point with `data-termin-hydrated`
 // after a successful mount so re-running the sweep (e.g. after a
