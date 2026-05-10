@@ -658,12 +658,23 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
     # A content with two state machines (e.g. lifecycle + approval status)
     # appears once with two list entries; the legacy one-SM-per-content
     # overwriting bug from v0.8 (sm_by_content[content] = sm) is gone.
+    #
+    # v0.9.4 Gap #3: each transition value is now a dict carrying both
+    # `required_scope` and `condition_expr` (the CEL form). Exactly one
+    # is non-empty per transition; the runtime state engine
+    # (termin_core.state.machine.do_state_transition) checks whichever
+    # is set. Pre-Gap-#3 the value was the bare scope string; the new
+    # shape is forward-compatible because the engine reads it via
+    # `.get("required_scope")` / `.get("condition_expr")`.
     from collections import defaultdict
     _sm_by_content = defaultdict(list)
     for sm in ir.get("state_machines", []):
         col = sm["machine_name"]   # already snake_case in IR
         trans_dict = {
-            (t["from_state"], t["to_state"]): t.get("required_scope", "")
+            (t["from_state"], t["to_state"]): {
+                "required_scope": t.get("required_scope", ""),
+                "condition_expr": t.get("condition_expr"),
+            }
             for t in sm.get("transitions", [])
         }
         _sm_by_content[sm["content_ref"]].append({

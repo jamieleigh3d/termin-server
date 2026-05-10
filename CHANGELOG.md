@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (v0.9.4 slice A3a — runtime wiring for CEL-condition state transitions)
+
+- **`sm_lookup` transition value shape extended to a dict**
+  carrying `required_scope` and `condition_expr`. The state
+  engine in `termin-core` reads via `isinstance(gate, dict)`
+  and falls back to the legacy bare-scope string (forward-
+  compat for any test or external runtime building against the
+  v0.9.3 shape). Source: `app.py` `_sm_by_content` builder.
+
+- **`expr_eval=ctx.expr_eval` threaded into both server-side
+  `do_state_transition` call sites** —
+  `transitions.py::transition_route` (the human-facing transition
+  endpoint) and `compute_runner.py::run_compute` (the agent-
+  invoked tool path). Without this, CEL-condition transitions
+  would fail closed with `TerminBadRequestError` at the runtime
+  even though the .termin source compiled cleanly.
+
+- **`pages.py` and `routes.py` shape-aware reads.** Two
+  legacy consumers of `sm_lookup` flatten the dict-shape gate
+  back to a bare scope string for their downstream contract:
+  - `pages.py::page_route` builds the `_sm_transitions`
+    template variable that the edit-modal Jinja template uses
+    as a `(from, to) -> scope` map. Templates indexing with
+    these tuples were broken by the dict shape ("unhashable
+    type: 'dict'"); the fix is a small `_scope_of` helper that
+    extracts `required_scope` from a dict gate or returns the
+    bare string. Forward-compat both ways.
+  - `routes.py::handle_runtime_bootstrap` projects sm_lookup
+    into the JSON the JS client receives; same flattening.
+
+- **Test coverage:** server suite stays at 113 tests passing
+  (regression baseline preserved). The actual CEL-evaluation
+  unit tests live in termin-core's
+  `test_state_machine_cel_transitions.py` (8 new — see
+  termin-core CHANGELOG); termin-server inherits them via the
+  state-engine import.
+
+### Notes (v0.9.4 slice A3a — pairs with compiler + core commits)
+
+- The compiler-side gap fixes (classifier early-return + CEL-
+  condition AST/IR plumbing + analyzer updates + IR JSON
+  Schema documentation) ship in the paired termin-compiler
+  commit. The runtime CEL evaluation in `do_state_transition`
+  ships in the paired termin-core commit. The split mirrors the
+  v0.9.3 layering: framework-free state engine in core,
+  framework-bound (FastAPI ctx, sm_lookup builder) wiring in
+  server.
+
+- Without the runtime piece, CEL-condition state transitions
+  would silently allow every transition (the analyzer would
+  pass them, but the runtime would have nothing to evaluate
+  against). This commit closes the loop so the security
+  invariant — every transition has an explicit, audit-visible
+  gate — holds for both the scope and CEL forms.
+
 ### Added (v0.9.4 Path C — per-component contract dispatch in the SSR pipeline)
 
 - **`render_component(node, presentation_providers=None)` now

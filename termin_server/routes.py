@@ -969,13 +969,24 @@ def register_runtime_endpoints(app, ctx: RuntimeContext):
         # content_ref → machine_name → "from|to" → scope. External clients
         # see every machine on every content; legacy single-SM clients
         # that read transitions[content] directly need to update.
+        # v0.9.4 Gap #3: sm_lookup transition values are now dicts
+        # ({required_scope, condition_expr}) instead of bare scope
+        # strings. The bootstrap payload to JS clients only needs the
+        # scope (the condition_expr is a server-side gate not exposed
+        # to the client; client-side dropdown filtering only checks
+        # scope membership). Flatten via the same shape-aware helper
+        # the page renderer uses; legacy bare-string values still work.
+        def _scope_of(gate):
+            if isinstance(gate, dict):
+                return gate.get("required_scope", "")
+            return gate or ""
         transitions = {}
         for content_ref, sm_list in ctx.sm_lookup.items():
             transitions[content_ref] = {}
             for sm in sm_list:
                 transitions[content_ref][sm["machine_name"]] = {
-                    f"{from_s}|{to_s}": scope
-                    for (from_s, to_s), scope in sm["transitions"].items()
+                    f"{from_s}|{to_s}": _scope_of(gate)
+                    for (from_s, to_s), gate in sm["transitions"].items()
                 }
         return {
             "identity": {"role": role, "scopes": user["scopes"], "profile": user["profile"]},

@@ -791,7 +791,8 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 result = await do_state_transition(
                     ctx.storage, cname, rid, machine, target,
                     {"role": "service", "scopes": list(ctx.scope_for_content_verb(cname, "update") or [])},
-                    ctx.sm_lookup, ctx.terminator, ctx.event_bus)
+                    ctx.sm_lookup, ctx.terminator, ctx.event_bus,
+                    expr_eval=ctx.expr_eval)
                 return result
 
             elif tool_name in invokes_list:

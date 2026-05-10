@@ -123,10 +123,22 @@ def _register_page_get(app, ctx, page, slug, page_reqs, page_templates,
                 for sm in sm_list:
                     trans = sm.get("transitions", {})
                     machine = sm.get("machine_name", "")
-                    all_transitions.update(trans)
-                    sm_transitions_by_machine[(sm_content, machine)] = trans
+                    # v0.9.4 Gap #3: transition values are now dicts
+                    # ({required_scope, condition_expr}) instead of
+                    # bare scope strings. The legacy edit-modal JS
+                    # dropdown templates expect a flat scope string in
+                    # `scope`, so flatten the value at this read site.
+                    # Forward-compat: legacy bare-string values still
+                    # work via the isinstance check.
+                    def _scope_of(gate):
+                        if isinstance(gate, dict):
+                            return gate.get("required_scope", "")
+                        return gate or ""
+                    flat_trans = {k: _scope_of(v) for k, v in trans.items()}
+                    all_transitions.update(flat_trans)
+                    sm_transitions_by_machine[(sm_content, machine)] = flat_trans
                     sm_transitions_by_content[sm_content].extend([
-                        {"from": f, "to": t, "scope": s,
+                        {"from": f, "to": t, "scope": _scope_of(s),
                          "machine_name": machine}
                         for (f, t), s in trans.items()
                     ])

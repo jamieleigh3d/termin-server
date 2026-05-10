@@ -126,7 +126,8 @@ def register_transition_routes(app, ctx: RuntimeContext):
 
             result = await do_state_transition(
                 ctx.storage, content, record_id, machine_name, target, user,
-                ctx.sm_lookup, ctx.terminator, ctx.event_bus)
+                ctx.sm_lookup, ctx.terminator, ctx.event_bus,
+                expr_eval=ctx.expr_eval)
             is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
             # Build feedback message
