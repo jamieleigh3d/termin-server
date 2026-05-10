@@ -1678,6 +1678,13 @@ async function loadCsrBundles() {
     // tags for each bundle. Skip any URL that's already in the
     // document so we don't double-execute the bundle.
     const seen = new Set();
+    // v0.9.4 Path C: collect script load promises so we can run a
+    // mount-point sweep AFTER every dynamically-injected bundle has
+    // had a chance to register its renderers. Without this, the
+    // sweep races the bundle: the script tag is appended but the
+    // renderer registration fires asynchronously, and the sweep
+    // finds the registry empty for the contract.
+    const loadPromises = [];
     for (const entry of bundles) {
       if (!entry || !entry.url || seen.has(entry.url)) continue;
       seen.add(entry.url);
@@ -1693,12 +1700,93 @@ async function loadCsrBundles() {
       script.async = true;
       script.dataset.terminCsrBundle = entry.contract;
       script.dataset.terminCsrProvider = entry.provider || "";
+      loadPromises.push(new Promise((resolve) => {
+        // Resolve on either load or error — a failed bundle still
+        // unblocks the sweep so other contracts hydrate. The error
+        // is already surfaced through the warn() call below the
+        // outer try.
+        script.addEventListener("load", () => resolve());
+        script.addEventListener("error", () => resolve());
+      }));
       document.head.appendChild(script);
     }
+    // Wait for every newly-injected bundle to load before sweeping.
+    // The static-script-tag path (B'-mode shell) doesn't go through
+    // here — those bundles are evaluated synchronously during HTML
+    // parsing and their renderers are already registered by the
+    // time hydrateAll runs.
+    if (loadPromises.length > 0) {
+      await Promise.all(loadPromises);
+    }
+    hydrateCsrMounts();
   } catch (err) {
     // Bundle load failures are non-fatal — SSR remains in effect.
     console.warn("[Termin] CSR bundle load failed:", err.message);
   }
+}
+
+// v0.9.4 Path C: per-component CSR mount-point hydrator.
+//
+// Walks every `[data-termin-csr-mount][data-termin-contract]`
+// element the SSR pipeline emitted (presentation.py
+// `_render_via_provider` for CSR-only providers). For each one,
+// looks up the registered renderer for the contract name and calls
+// it with `(mountPoint, irFragment)`. The IR fragment is parsed
+// from the `data-termin-ir` attribute (HTML-escaped JSON).
+//
+// Idempotent: marks each mount point with `data-termin-hydrated`
+// after a successful mount so re-running the sweep (e.g. after a
+// late-arriving bundle) doesn't re-mount the same React tree on
+// top of itself.
+//
+// If no renderer is registered for a contract by the time the
+// sweep runs, the element is left as-is. The bundle's late
+// registration won't auto-hydrate it — that's a design gap a
+// future slice can close (a queue of pending mounts, or
+// MutationObserver), but for v0.9.4 the bundle-load Promise.all
+// in loadCsrBundles() ordering is sufficient.
+function hydrateCsrMounts() {
+  const nodes = document.querySelectorAll(
+    "[data-termin-csr-mount][data-termin-contract]:not([data-termin-hydrated])"
+  );
+  if (nodes.length === 0) return;
+  nodes.forEach((node) => {
+    const contract = node.getAttribute("data-termin-contract");
+    if (!contract) return;
+    const renderer = getRenderer(contract);
+    if (typeof renderer !== "function") {
+      // Bundle for this contract didn't load (or hasn't yet).
+      // Surface to the console; leave the mount-point in place so
+      // the page isn't blank where the component should be.
+      console.warn(
+        `[Termin] hydrateCsrMounts: no renderer for ${JSON.stringify(contract)}` +
+        ` — bundle missing or failed to load`
+      );
+      return;
+    }
+    // Decode the IR fragment. `textContent` of an attribute returns
+    // the HTML-decoded string (escaped &, ", &lt;, etc. all reverse).
+    const irRaw = node.getAttribute("data-termin-ir") || "{}";
+    let irFragment;
+    try {
+      irFragment = JSON.parse(irRaw);
+    } catch (err) {
+      console.warn(
+        `[Termin] hydrateCsrMounts: malformed IR for ${contract}:`,
+        err.message
+      );
+      return;
+    }
+    try {
+      renderer(node, irFragment);
+      node.setAttribute("data-termin-hydrated", "true");
+    } catch (err) {
+      console.warn(
+        `[Termin] hydrateCsrMounts: renderer for ${contract} threw:`,
+        err.message
+      );
+    }
+  });
 }
 
 // ── v0.9 Phase 5b.4 B' plumbing: SPA navigation + action dispatch ──

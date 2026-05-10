@@ -40,12 +40,24 @@ def register_page_routes(app, ctx: RuntimeContext):
     for page in ctx.ir.get("pages", []):
         pages_by_slug.setdefault(page["slug"], []).append(page)
 
+    # v0.9.4 Path C: thread the bound presentation providers into the
+    # template builders so per-component contract overrides reach
+    # their bound providers. Without this, `Using "<ns>.<contract>"`
+    # silently drops at render time and the type-default renderer
+    # (e.g. tailwind-default `_render_data_table`) handles the node.
+    presentation_providers = getattr(ctx, "presentation_providers", []) or []
     page_templates = {}
     for slug, pages_list in pages_by_slug.items():
         if len(pages_list) == 1:
-            page_templates[slug] = build_page_template(pages_list[0])
+            page_templates[slug] = build_page_template(
+                pages_list[0],
+                presentation_providers=presentation_providers,
+            )
         else:
-            page_templates[slug] = build_merged_page_template(pages_list)
+            page_templates[slug] = build_merged_page_template(
+                pages_list,
+                presentation_providers=presentation_providers,
+            )
 
     compute_js = build_compute_js(ctx.ir)
 

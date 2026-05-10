@@ -276,6 +276,14 @@ def _populate_presentation_providers(
     # provider product to all contracts declared by the
     # airlock-components contract package, exactly the way
     # presentation-base namespace bindings already work.
+    #
+    # v0.9.4 Path C: when neither presentation-base nor a contract-
+    # package YAML covers the namespace, fall back to the bound
+    # provider's own `declared_contracts`. This makes a per-provider
+    # package (the Airlock-on-Termin shape) deployable with a single
+    # `bindings.presentation.<namespace>: {provider: <product>}`
+    # line — no contract-package YAML required for the simple case
+    # where one provider owns one namespace exhaustively.
     pkg_registry = getattr(ctx, "contract_package_registry", None)
     contract_bindings: dict[str, dict] = {}
     for key, binding in bindings.items():
@@ -285,8 +293,11 @@ def _populate_presentation_providers(
             contract_bindings[key] = binding
             continue
         # Namespace binding.
+        full_names: tuple[str, ...] = ()
         if key == "presentation-base":
-            shorts: tuple[str, ...] = PRESENTATION_BASE_CONTRACTS
+            full_names = tuple(
+                f"presentation-base.{s}" for s in PRESENTATION_BASE_CONTRACTS
+            )
         elif pkg_registry is not None and key in pkg_registry.namespaces():
             # Look up the contracts declared by this package and
             # fan the binding out to each. The registry's
@@ -294,15 +305,27 @@ def _populate_presentation_providers(
             # private packages map to enumerate all contracts in
             # the namespace.
             pkg = pkg_registry._packages.get(key)
-            shorts = tuple(c.name for c in pkg.contracts) if pkg else ()
+            if pkg:
+                full_names = tuple(f"{key}.{c.name}" for c in pkg.contracts)
         else:
-            # Unknown namespace — quietly skip. Deploy-time
-            # validation in BRD #2 §8.5 (required_contracts) is the
-            # right place to fail-closed; this populator is purely
-            # advisory.
-            shorts = ()
-        for short in shorts:
-            full = f"{key}.{short}"
+            # v0.9.4 Path C fallback: instantiate the provider and
+            # ask which contracts it declares in this namespace.
+            # The instance is cached in `instances` so the later
+            # materialization loop doesn't re-build it. Quietly
+            # skip if the product isn't registered or the provider
+            # has no `declared_contracts` — deploy-time validation
+            # (BRD #2 §8.5 required_contracts) is the right place
+            # to fail-closed; this populator stays advisory.
+            product = binding.get("provider")
+            instance = (
+                _get_or_create(product, binding.get("config") or {})
+                if product else None
+            )
+            if instance is not None:
+                declared = getattr(instance, "declared_contracts", ()) or ()
+                prefix = f"{key}."
+                full_names = tuple(c for c in declared if c.startswith(prefix))
+        for full in full_names:
             contract_bindings.setdefault(full, binding)
 
     # Materialize: one (contract, product, instance) triple per

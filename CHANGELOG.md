@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Path C — per-component contract dispatch in the SSR pipeline)
+
+- **`render_component(node, presentation_providers=None)` now
+  dispatches by `node["contract"]` first, falling back to the
+  legacy `node["type"]` table.** When the IR carries a
+  `Using "<ns>.<contract>"` override (e.g.
+  `Using "airlock.cosmic-orb"`), the compiler lowers it onto
+  `node["contract"]`. Pre-Path-C the SSR pipeline ignored that
+  field, so custom-namespace overrides silently dropped at
+  render time and the type-default renderer (e.g.
+  `_render_data_table`) handled the node. Post-Path-C the SSR
+  pipeline looks up the bound provider in the new
+  `presentation_providers` argument and routes:
+  - SSR-capable provider (declares `"ssr"` in `render_modes`):
+    call `provider.render_ssr(contract, node, {}, {})` and
+    inline the returned markup.
+  - CSR-only provider: emit a mount-point `<div>` carrying
+    the qualified contract name (`data-termin-contract`) and
+    the IR fragment as HTML-escaped JSON (`data-termin-ir`).
+    The new `hydrateCsrMounts()` JS sweep parses the IR back,
+    calls the registered renderer, and tags the element
+    `data-termin-hydrated` so re-runs are idempotent.
+
+  Falls through to type dispatch when the contract isn't bound
+  — defensive, since the populator may have skipped a
+  misconfigured binding. Provider exceptions are caught and
+  rendered as visible markup so failures show in the browser
+  rather than silently corrupting the page.
+
+- **`build_page_template` and `build_merged_page_template` now
+  accept `presentation_providers=None`** and thread the value
+  through every `render_component` call. `pages.py` reads
+  `ctx.presentation_providers` once at startup and passes it
+  in. Old-shape callers (no kwarg) keep working — they just
+  don't get contract dispatch, which is the legacy behavior.
+
+- **`_populate_presentation_providers` learned a third
+  namespace-expansion fallback.** Pre-Path-C, namespace
+  bindings (`bindings.presentation.<key>`) only expanded when
+  `key == "presentation-base"` (hardcoded list) or
+  `key in pkg_registry.namespaces()` (a contract-package YAML).
+  Custom-namespace bindings without a contract package
+  (`bindings.presentation.airlock: {provider: airlock}`) got
+  silently dropped — `ctx.presentation_providers` never saw
+  the contracts. Path C adds: when neither path matches,
+  instantiate the provider, read its `declared_contracts`,
+  and bind each contract whose name starts with `<key>.`.
+  Makes a per-provider package (the Airlock-on-Termin shape)
+  deployable with one binding line, no contract-package YAML
+  required for the simple case where one provider owns one
+  namespace exhaustively.
+
+- **`hydrateCsrMounts()` in `static/termin.js`.** Walks
+  `[data-termin-csr-mount][data-termin-contract]:not([data-termin-hydrated])`
+  after every dynamically-injected bundle has loaded
+  (`loadCsrBundles()` now collects `script.onload` promises
+  and awaits them all before sweeping). Decodes the IR JSON,
+  calls the registered renderer with `(mountPoint, irFragment)`,
+  marks the node hydrated. Idempotent. Missing renderer
+  surfaces as a console warning rather than silent failure.
+  Tested in production via the `airlock-smoke-runtime` launch
+  entry: cosmic-orb mount point hydrates into the expected
+  CosmicOrb SVG (verified via accessibility-tree snapshot
+  showing the SVG's aria-label).
+
+- **`tests/test_path_c_dispatch.py` — 11 new unit tests** covering:
+  - Namespace-expansion fallback: unknown namespace expands via
+    `declared_contracts`; cross-namespace contracts on the same
+    provider don't leak; per-contract bindings still work.
+  - `render_component` contract dispatch: no-contract falls back
+    to type dispatch, unbound contract falls back, CSR-only
+    emits mount point with proper data-attrs, IR round-trips
+    through HTML escaping (quotes + ampersands), SSR-capable
+    inlines provider output, exact-match prevents partial-name
+    collisions.
+  - `build_page_template` + `build_merged_page_template` thread
+    providers through to `render_component`.
+
+  Total Python tests: 102 → 113. All green.
+
+### Notes (Path C — what this unblocks)
+
+- Airlock-on-Termin can now render through the actual runtime.
+  The v0.9.4 Path B work in
+  [`termin-airlock-provider`](https://github.com/jamieleigh3d/termin-airlock-provider)
+  hit a wall because the SSR pipeline ignored
+  `Using "airlock.cosmic-orb"` overrides — the
+  `airlock-smoke-runtime` launch entry served the
+  tailwind-default `data_table` renderer instead of the airlock
+  provider's CosmicOrb. Path C closes that gap; the override
+  reaches the registered provider, the CSR mount-point dispatch
+  fires, the bundle hydrates the React tree.
+
+- The roadmap row at
+  `termin-compiler/docs/termin-roadmap.md:441` deferred this
+  work to v0.10 ("Per-component override-mode dispatch ...
+  needs a rewrite of the SSR Jinja path"). Pulling it forward
+  into v0.9.4 to unblock the Airlock port. The implementation
+  is additive — old-shape `render_component(node)` calls keep
+  working — so the roadmap row's "deferred to v0.10" framing
+  was over-cautious. The actual surface is ~150 lines + 11
+  tests, not the rewrite the row implied.
+
+- Per-component override DOES NOT yet support mixed providers
+  on the same page (Tailwind-rendered table next to a Spectrum
+  data_table next to an airlock cosmic-orb). The dispatch
+  table can express it; the deploy-config schema can't yet
+  bind two products to overlapping contract surfaces. v0.10
+  follow-up.
+
 ### Added
 
 - **`termin_server.__version__`** is now declared in

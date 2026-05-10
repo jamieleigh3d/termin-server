@@ -1030,27 +1030,155 @@ RENDERERS = {
 }
 
 
-def render_component(node: dict) -> str:
-    """Render a single component node to a Jinja2 template fragment."""
+# ── v0.9.4 Path C: contract-first dispatch ──
+#
+# When the IR carries a `Using "<ns>.<contract>"` override the
+# compiler lowers it onto `node["contract"]`. The legacy SSR pipeline
+# dispatched only on `node["type"]`, so the override silently dropped
+# at render time and the page rendered through the type-default
+# renderer (e.g. tailwind-default `_render_data_table`). This is the
+# 5b.3 cut-over the roadmap deferred — pulled forward in v0.9.4 to
+# unblock the Airlock-on-Termin port.
+#
+# Two cases for a bound provider:
+#
+#   * SSR-capable: the provider implements `render_ssr`, so we call
+#     it and inline the returned markup directly into the page
+#     template. No client-side hydration step required.
+#
+#   * CSR-only (the Airlock case, mirroring Spectrum's chat-component
+#     pattern): the provider can't render server-side. We emit a
+#     mount-point div with the IR fragment serialized into a data
+#     attribute; termin.js's `hydrateCsrMounts` walks these post-
+#     bundle-load and calls `getRenderer(contract)` to mount the
+#     React tree.
+#
+# The lookup is exact-match on the qualified contract name. A typo
+# in `Using` falls through to type dispatch, which is the right
+# behavior — the type-based renderer is always a safe default.
+
+def _find_provider_for_contract(presentation_providers, contract: str):
+    """Linear search for a provider bound to the exact contract name.
+
+    Returns the provider instance or None. The list is small (one
+    entry per bound contract — six for Airlock, ten for Tailwind);
+    a dict index would be premature optimization."""
+    if not presentation_providers or not contract:
+        return None
+    for c, _product, provider in presentation_providers:
+        if c == contract:
+            return provider
+    return None
+
+
+def _render_via_provider(node: dict, contract: str, provider) -> str:
+    """Dispatch a node to its bound provider.
+
+    SSR-capable provider: call `render_ssr` with empty data /
+    principal context (the SSR Jinja path supplies its own data
+    via template context, not via the provider Protocol). The
+    provider's exception bubbles up framed as visible markup so
+    the failure is easy to spot in the browser rather than silent.
+
+    CSR-only provider: emit a mount-point div carrying the IR
+    fragment as an HTML-escaped JSON attribute. termin.js parses
+    it back at hydration time."""
+    import html
+    import json as _json
+
+    modes = tuple(getattr(provider, "render_modes", ()) or ())
+    if "ssr" in modes:
+        try:
+            # Pass empty data / principal_context — the existing SSR
+            # pipeline binds data via Jinja template context, not via
+            # the Protocol's `PresentationData`. SSR-capable custom
+            # providers either render purely from `ir_fragment` props
+            # (the common case) or document their need for richer
+            # data plumbing (a v0.10 follow-up if it shows up).
+            return provider.render_ssr(contract, node, {}, {})
+        except NotImplementedError:
+            # Provider declared SSR support but didn't implement it.
+            # Fall through to the CSR mount-point path below as a
+            # safety net rather than crashing the page render.
+            pass
+        except Exception as exc:
+            return (
+                f'<div class="text-red-600 text-sm" '
+                f'data-termin-provider-error="{html.escape(contract)}">'
+                f'[provider {html.escape(contract)} render_ssr failed: '
+                f'{type(exc).__name__}: {html.escape(str(exc))}]'
+                f'</div>'
+            )
+    if "csr" in modes:
+        ir_attr = html.escape(_json.dumps(node), quote=True)
+        return (
+            f'<div data-termin-csr-mount '
+            f'data-termin-contract="{html.escape(contract)}" '
+            f'data-termin-ir="{ir_attr}"></div>'
+        )
+    # Provider declared no render modes — render a debug marker so
+    # the misconfiguration is visible.
+    return (
+        f'<div class="text-yellow-700 text-sm" '
+        f'data-termin-provider-empty-modes="{html.escape(contract)}">'
+        f'[provider {html.escape(contract)} declares no render_modes]'
+        f'</div>'
+    )
+
+
+def render_component(node: dict, presentation_providers=None) -> str:
+    """Render a single component node to a Jinja2 template fragment.
+
+    Dispatch order (v0.9.4 Path C):
+
+      1. If `node["contract"]` names a bound provider in
+         `presentation_providers`, dispatch via that provider
+         (`_render_via_provider`). Custom-namespace contracts
+         like `airlock.cosmic-orb` reach their registered provider
+         here.
+
+      2. Otherwise fall back to the legacy type-based dispatch
+         table (`RENDERERS`). presentation-base contracts and
+         every existing app rendered before Path C continue
+         through this path unchanged.
+
+    `presentation_providers` defaults to None for backward
+    compatibility with call sites that don't yet thread the
+    providers list through (and for the type-dispatch unit tests
+    that don't need it).
+    """
+    contract = node.get("contract")
+    if contract:
+        provider = _find_provider_for_contract(
+            presentation_providers, contract)
+        if provider is not None:
+            return _render_via_provider(node, contract, provider)
     renderer = RENDERERS.get(node.get("type", ""), _render_unknown)
     return renderer(node)
 
 
 # ── Page template builders ──
 
-def build_page_template(page: dict) -> object:
+def build_page_template(page: dict, presentation_providers=None) -> object:
     """Build a Jinja2 template for a page from its component tree.
 
     Text component expressions emit {{ termin_eval("expr") }} calls
-    that are evaluated server-side at render time via the template context.
+    that are evaluated server-side at render time via the template
+    context.
+
+    `presentation_providers` is threaded into `render_component` so
+    custom-namespace contract overrides reach their bound providers
+    (v0.9.4 Path C).
     """
     parts = [f'<h1 class="text-2xl font-bold mb-4">{page["name"]}</h1>']
     for child in page.get("children", []):
-        parts.append(render_component(child))
+        parts.append(render_component(child, presentation_providers))
     return jinja_env.from_string("\n".join(parts))
 
 
-def build_merged_page_template(pages: list) -> object:
+def build_merged_page_template(
+    pages: list, presentation_providers=None,
+) -> object:
     """Build a role-conditional template for multiple pages sharing a slug."""
     parts = [f'<h1 class="text-2xl font-bold mb-4">{pages[0]["name"]}</h1>']
     for page in pages:
@@ -1058,7 +1186,8 @@ def build_merged_page_template(pages: list) -> object:
         cond = f'{{% if current_role == "{role}" or current_role|lower == "{role.lower()}" %}}'
         page_content = []
         for child in page.get("children", []):
-            page_content.append(render_component(child))
+            page_content.append(
+                render_component(child, presentation_providers))
         if page_content:
             parts.append(cond)
             parts.extend(page_content)
