@@ -35,6 +35,29 @@ class TestStubAgentProviderIsConfigured:
         provider = StubAgentProvider()
         assert provider.is_configured is True
 
+    def test_service_property_returns_stub(self):
+        """v0.9.4 follow-up: the compute runner reads
+        provider.service for log shape + Anthropic special-casing.
+        Stub returns 'stub' so log lines render cleanly and the
+        Anthropic-specific paths skip."""
+        from termin_server.providers.builtins.compute_agent_stub import (
+            StubAgentProvider,
+        )
+        assert StubAgentProvider().service == "stub"
+
+    def test_model_property_returns_default(self):
+        from termin_server.providers.builtins.compute_agent_stub import (
+            StubAgentProvider,
+        )
+        assert StubAgentProvider().model == "stub-agent-1"
+
+    def test_model_property_honors_config_override(self):
+        from termin_server.providers.builtins.compute_agent_stub import (
+            StubAgentProvider,
+        )
+        provider = StubAgentProvider(config={"model_identifier": "custom-id"})
+        assert provider.model == "custom-id"
+
     def test_with_config(self):
         from termin_server.providers.builtins.compute_agent_stub import (
             StubAgentProvider,

@@ -86,6 +86,22 @@ class StubAgentProvider:
         """
         return True
 
+    @property
+    def service(self) -> str:
+        """v0.9.4 (server issue #1 follow-up): the compute runner
+        reads `provider.service` for log lines and to special-case
+        Anthropic-vs-other plumbing (`compute_runner.py:438,512,869`).
+        Returns "stub" so the log line shape stays consistent and
+        the Anthropic-specific paths skip cleanly."""
+        return "stub"
+
+    @property
+    def model(self) -> str:
+        """Surfaces the configured model identifier for log /
+        audit. Stub providers default to "stub-agent-1" unless
+        overridden via deploy config `model_identifier`."""
+        return self._model_id
+
     async def invoke(
         self,
         directive: str,

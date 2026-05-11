@@ -77,6 +77,20 @@ class StubLlmProvider:
         """
         return True
 
+    @property
+    def service(self) -> str:
+        """v0.9.4 (server issue #1 follow-up): the compute runner
+        reads `provider.service` for log lines + special-casing
+        Anthropic plumbing. Returns "stub" so log shape stays
+        consistent."""
+        return "stub"
+
+    @property
+    def model(self) -> str:
+        """Stub providers default to "stub-llm-1" unless overridden
+        via deploy config `model_identifier`."""
+        return self._model_id
+
     async def complete(
         self,
         directive: str,
