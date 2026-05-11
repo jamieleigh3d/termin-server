@@ -73,6 +73,19 @@ class StubAgentProvider:
         )
         self._config_hash = hash_provider_config(self._config)
 
+    @property
+    def is_configured(self) -> bool:
+        """v0.9.4 (server issue #1): the stub provider is always
+        configured. The compute runner gates execution on this
+        property (`compute_runner.py:428,612`); without it,
+        `getattr(provider, "is_configured", False)` returns False
+        and stub-bound computes are silently skipped at every
+        invocation. The whole point of the stub is to exercise
+        plumbing without external dependencies — there's nothing
+        to wait for, so it's always ready.
+        """
+        return True
+
     async def invoke(
         self,
         directive: str,

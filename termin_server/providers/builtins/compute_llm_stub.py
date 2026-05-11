@@ -67,6 +67,16 @@ class StubLlmProvider:
         self._model_id: str = str(self._config.get("model_identifier", "stub-llm-1"))
         self._config_hash = hash_provider_config(self._config)
 
+    @property
+    def is_configured(self) -> bool:
+        """v0.9.4 (server issue #1): the stub provider is always
+        configured. The compute runner gates execution on this
+        property; without it, stub-bound computes are silently
+        skipped. The stub exists to exercise plumbing without
+        external dependencies — nothing to wait for.
+        """
+        return True
+
     async def complete(
         self,
         directive: str,
