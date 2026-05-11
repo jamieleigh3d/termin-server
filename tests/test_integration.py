@@ -1421,3 +1421,93 @@ As anonymous, I want a chat:
         assert kinds == ["user", "system_event", "user", "user"], (
             f"rule should single-shot — got entry kinds {kinds}"
         )
+
+
+class TestWhenRuleAppendedEntryPredicateGuard:
+    """v0.9.4 (compiler issue #8): When-rules whose condition_expr
+    references `appended_entry` should not fire on non-append
+    events (create / update / delete / state-machine-entered /
+    etc.) where `appended_entry` is unbound. Today they fire
+    anyway; the predicate errors with KeyError; the runtime logs
+    a multi-line WARN; the rule silent-skips. Functionally
+    "correct" but log-spammy and hides real predicate errors.
+
+    Fix: pre-filter the dispatch loop to skip rules whose
+    predicate references `appended_entry` when `appended_entry`
+    is None.
+    """
+
+    _SOURCE = '''Application: Appended Entry Guard Test
+  Description: v0.9.4 issue #8 fixture
+Id: 9d3e4f5a-6b7c-4d8e-8f9a-1b2c3d4e5f6a
+
+Identity:
+  Scopes are "play"
+  An "anonymous" has "play"
+
+Content called "sessions":
+  Each session has a name which is text
+  Each session has counter which is a whole number
+  Each session has a conversation which is conversation
+  Anyone with "play" can view sessions
+  Anyone with "play" can update sessions
+  Anyone with "play" can create sessions
+  Anyone with "play" can append to sessions.conversation
+
+When `appended_entry.kind == "user"`:
+  Update sessions: counter = `1`
+  Log level: INFO
+
+As anonymous, I want a chat:
+  Show a page called "Chat"
+'''
+
+    @pytest.fixture
+    def client(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from termin.peg_parser import parse_peg
+        from termin.analyzer import analyze
+        from termin.lower import lower
+        from termin_core.ir.serialize import serialize_ir
+        from termin_server import create_termin_app
+
+        program, perr = parse_peg(self._SOURCE)
+        assert perr.ok, perr.format()
+        aerr = analyze(program)
+        assert aerr.ok, aerr.format()
+        spec = lower(program)
+        ir_json = serialize_ir(spec)
+
+        db_path = str(tmp_path / "appended_entry_guard.db")
+        app = create_termin_app(ir_json, db_path=db_path)
+        with TestClient(app) as c:
+            yield c
+
+    def test_create_does_not_fire_appended_entry_rule(self, client, capsys):
+        """Creating a session fires the `<content>.created` event,
+        which dispatches to all When-rules for the content. Rules
+        whose predicate references `appended_entry` should NOT
+        evaluate at all (and therefore NOT log CEL errors).
+        Verifies via stderr capture: no `WARN] Event handler
+        error` lines should appear after a single create."""
+        # Clear any prior captures
+        capsys.readouterr()
+        # Create a session — fires the create event
+        r = client.post("/api/v1/sessions", json={"name": "guard test"})
+        assert r.status_code in (200, 201), r.text
+        captured = capsys.readouterr()
+        # The fix: no event-handler errors at all on a clean create
+        # of a content type with no other When-rules.
+        assert "Event handler error" not in captured.out, (
+            f"Create event triggered an appended_entry-using rule "
+            f"to error; expected the rule to be skipped silently. "
+            f"Captured stdout:\n{captured.out}"
+        )
+        assert "Event handler error" not in captured.err, (
+            f"Same as above but stderr. Captured stderr:\n{captured.err}"
+        )
+
+    # Regression guard for "rule still fires on real user appends"
+    # is already covered by TestWhenRuleUpdateAction's tests above
+    # (which exercise the full Append + Update verb chain).

@@ -838,6 +838,24 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
         for ev in ir.get("events", []):
             if ev.get("trigger") == "expr" and ev.get("condition_expr"):
                 if content_name == ev.get("source_content", ""):
+                    # v0.9.4 (compiler issue #8): skip rules whose
+                    # predicate references `appended_entry` when the
+                    # current event isn't an `<X>.<field>.appended`
+                    # event (so `appended_entry` is unbound). Without
+                    # this filter, every session create / lifecycle
+                    # transition fires every appended_entry-using rule
+                    # in the source, each one errors with KeyError on
+                    # `appended_entry.kind`, and the runtime logs a
+                    # multi-line WARN per failure. The functional
+                    # impact pre-filter is "rule silent-skips on
+                    # error" which is correct safety behavior, but the
+                    # log noise hides real predicate errors. Filter
+                    # is lexical (substring check) — cheaper than
+                    # re-walking the AST and adequate for the
+                    # one-binding-name shape v0.9.x supports.
+                    if (appended_entry is None
+                            and "appended_entry" in (ev.get("condition_expr") or "")):
+                        continue
                     evctx = dict(record)
                     for k, v in list(record.items()):
                         parts = k.split("_")
