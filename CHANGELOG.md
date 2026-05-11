@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v0.9.4 A3b #2 — stub providers expose `.legacy` adapter)
+
+- **`StubAgentProvider.legacy`** and **`StubLlmProvider.legacy`**
+  properties added. The compute runner routes ai-agent and LLM
+  computes through `provider.legacy` for SDK-shaped calls (per
+  compute_runner.py:425, this indirection is slated for removal in
+  v0.10 slice (c); the shim is band-aid over architectural drift
+  the codebase already plans to fix).
+
+  Surface area implemented:
+
+  - `legacy.agent_loop(system_prompt, user_message, tools,
+    execute_tool) -> dict` — non-streaming fallback. Runs the
+    scripted tool calls sequentially via `execute_tool` and
+    returns a `{"thinking": ..., "summary": ...}` dict.
+  - `legacy.agent_loop_streaming(system_prompt, user_message,
+    tools, execute_tool, on_event) -> dict` — streaming non-conv
+    entry point. Fires `on_event` per tool call/result and
+    always emits a final `{"type": "done", ...}` event.
+  - `legacy.agent_loop_with_conversation(system_prompt, messages,
+    tools, execute_tool, on_writeback, on_text_delta=None,
+    on_text_end=None, should_halt=None, ...)` — conv-mode entry
+    point. Per scripted tool_call, fires
+    `on_writeback(kind="tool_call", body=, tool_call_id=,
+    tool_name=, tool_args=)` then
+    `on_writeback(kind="tool_result", body=, tool_call_id=,
+    is_error=)`. After all tool calls, fires
+    `on_writeback(kind="agent", body=)` for the final text and
+    `on_text_end(committed=True/False)` for streaming UIs.
+    Honors `should_halt` between tool calls.
+  - `legacy.complete(system_prompt, user_message, output_tool)
+    -> dict` (LLM stub) — matches the response map and returns
+    the response's `output_value` merged with a `thinking` key.
+
+  Without these, stub-bound ai-agent computes crashed with
+  `AttributeError: 'StubAgentProvider' object has no attribute
+  'legacy'` after passing the `is_configured` gate. Surfaced
+  during Airlock-on-Termin smoke. Closes server issue #2.
+
+  20 new tests in
+  `tests/test_stub_provider_legacy_adapter_v094.py` covering all
+  three agent methods + LLM complete + halt + text-delta/end +
+  prompt-matching across scripts.
+
 ### Added (v0.9.4 slice A3a — runtime executor for the When-rule Update action)
 
 - **When-rule action dispatcher gains an Update branch.** When

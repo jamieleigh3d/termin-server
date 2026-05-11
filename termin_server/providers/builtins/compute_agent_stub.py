@@ -41,6 +41,8 @@ Configuration shape (deploy_config["bindings"]["compute"]["<name>"]
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any, AsyncIterator, Mapping, Optional
 
 from termin_core.providers.contracts import Category, ContractRegistry
@@ -101,6 +103,26 @@ class StubAgentProvider:
         audit. Stub providers default to "stub-agent-1" unless
         overridden via deploy config `model_identifier`."""
         return self._model_id
+
+    @property
+    def legacy(self) -> "_StubAgentLegacyAdapter":
+        """v0.9.4 (server issue #2): the compute runner routes
+        ai-agent computes through ``provider.legacy`` for SDK-
+        shaped calls (`agent_loop_with_conversation`,
+        `agent_loop_streaming`, `agent_loop`). The stub
+        implements the modern Protocol shape (`invoke`,
+        `invoke_streaming`); this adapter translates the
+        runtime's legacy calls into scripted-script behavior
+        so stub-bound ai-agent computes work end-to-end
+        without external dependencies.
+
+        Per compute_runner.py:425, ``.legacy`` is slated for
+        removal in v0.10 slice (c). The adapter is band-aid
+        over architectural drift the codebase already plans to
+        fix; when slice (c) lands, the runtime will call the
+        modern Protocol directly and this property goes away.
+        """
+        return _StubAgentLegacyAdapter(self)
 
     async def invoke(
         self,
@@ -237,6 +259,251 @@ async def _maybe_await(callback, tool: str, args: Mapping[str, Any]):
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+# ── Legacy adapter (v0.9.4 server issue #2) ──
+
+
+class _StubAgentLegacyAdapter:
+    """Adapter that translates the runtime's legacy SDK-shaped calls
+    (`agent_loop`, `agent_loop_streaming`,
+    `agent_loop_with_conversation`) into scripted-script behavior on
+    the wrapped ``StubAgentProvider``.
+
+    Lives here as a band-aid over the compute runner's `.legacy`
+    indirection (compute_runner.py:425 — "Slice (b) interim, slice
+    (c) deletes `.legacy`"). Once slice (c) lands, the runtime calls
+    the modern Protocol (`invoke`, `invoke_streaming`) directly and
+    this adapter goes away.
+
+    Behavior shapes the adapter must preserve (matching the Anthropic
+    legacy implementation in `ai_provider.py`):
+
+    - `agent_loop_with_conversation` fires on_writeback per scripted
+      tool_call (kind="tool_call" with tool_call_id/tool_name/
+      tool_args) followed by on_writeback for each tool_result
+      (kind="tool_result" with matching tool_call_id, is_error
+      reflecting whether execute_tool raised). After all scripted
+      calls complete, if the script declares a final body string,
+      fires on_writeback(kind="agent", body=<text>) followed by
+      on_text_end(committed=True). If no final body, fires
+      on_text_end(committed=False).
+    - `should_halt()` is checked between tool calls; halts the loop
+      when truthy (matches Anthropic legacy behavior at line 1191).
+    - All three methods return ``{"thinking": str, "summary": str}``
+      for audit consumers (compute_runner.py extracts ``thinking``
+      and logs it).
+    """
+
+    def __init__(self, provider: "StubAgentProvider") -> None:
+        self._provider = provider
+
+    async def agent_loop(
+        self,
+        system_prompt: str,
+        user_message: str,
+        tools: list,
+        execute_tool: Any,
+    ) -> dict:
+        """Non-streaming, non-conversation fallback. Runs the
+        scripted tool calls sequentially via ``execute_tool`` and
+        returns a thinking/summary dict."""
+        prompt = f"{system_prompt}\n{user_message}"
+        script = self._provider._match(prompt)
+        thinking_parts: list[str] = []
+        for call in script.get("tool_calls", []):
+            tool = call["tool"]
+            args = call.get("args", {}) or {}
+            try:
+                result = await execute_tool(tool, dict(args))
+                if result is not None:
+                    thinking_parts.append(f"{tool} -> ok")
+            except Exception as exc:  # noqa: BLE001
+                thinking_parts.append(f"{tool} -> error: {exc}")
+        final_body = _extract_final_body(script)
+        if final_body:
+            thinking_parts.append(final_body)
+        return {
+            "thinking": "\n".join(thinking_parts),
+            "summary": script.get("final_outcome", "success"),
+        }
+
+    async def agent_loop_streaming(
+        self,
+        system_prompt: str,
+        user_message: str,
+        tools: list,
+        execute_tool: Any,
+        on_event: Any,
+    ) -> dict:
+        """Streaming non-conversation entry point. Fires on_event
+        events as tools execute (event-bus consumers — compute
+        stream channels — render these). Always emits a final
+        ``{"type": "done", ...}`` event so subscribers know to
+        unsubscribe."""
+        prompt = f"{system_prompt}\n{user_message}"
+        script = self._provider._match(prompt)
+        for idx, call in enumerate(script.get("tool_calls", [])):
+            tool = call["tool"]
+            args = call.get("args", {}) or {}
+            call_id = f"stub-call-{idx}"
+            if on_event:
+                await on_event({
+                    "type": "tool_call",
+                    "tool": tool,
+                    "args": dict(args),
+                    "call_id": call_id,
+                })
+            try:
+                result = await execute_tool(tool, dict(args))
+                if on_event:
+                    await on_event({
+                        "type": "tool_result",
+                        "tool": tool,
+                        "call_id": call_id,
+                        "result": result,
+                        "is_error": False,
+                    })
+            except Exception as exc:  # noqa: BLE001
+                if on_event:
+                    await on_event({
+                        "type": "tool_result",
+                        "tool": tool,
+                        "call_id": call_id,
+                        "result": str(exc),
+                        "is_error": True,
+                    })
+        final_body = _extract_final_body(script)
+        result_dict = {
+            "thinking": final_body or "",
+            "summary": script.get("final_outcome", "success"),
+        }
+        if isinstance(script.get("final_result"), dict):
+            # Merge the script's final_result fields into the output
+            # so set_output-style consumers see them.
+            for k, v in script["final_result"].items():
+                if k not in result_dict:
+                    result_dict[k] = v
+        if on_event:
+            await on_event({"type": "done", "output": result_dict})
+        return result_dict
+
+    async def agent_loop_with_conversation(
+        self,
+        system_prompt: str,
+        messages: list,
+        tools: list,
+        execute_tool: Any,
+        on_writeback: Any,
+        on_text_delta: Any = None,
+        on_text_end: Any = None,
+        should_halt: Any = None,
+        on_event: Any = None,
+        max_turns: int = 20,
+    ) -> dict:
+        """v0.9.2 §11.5 conversation entry point.
+
+        Per scripted tool_call: fire on_writeback(kind="tool_call",
+        ...) → execute_tool → fire on_writeback(kind="tool_result",
+        ...). After all tool calls (or after should_halt fires),
+        if the script declares a final body, fire on_text_delta
+        with the full text + on_writeback(kind="agent", body=text)
+        + on_text_end(committed=True). If no final body, fire
+        on_text_end(committed=False).
+        """
+        # Materialize the messages list into a single objective
+        # string so the stub's substring matcher can find a script.
+        # The user content is what carries the prompt text in the
+        # Anthropic message shape.
+        objective_parts: list[str] = []
+        for msg in messages or []:
+            content = msg.get("content")
+            if isinstance(content, str):
+                objective_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        objective_parts.append(block.get("text", ""))
+        prompt = f"{system_prompt}\n" + "\n".join(objective_parts)
+        script = self._provider._match(prompt)
+
+        for idx, call in enumerate(script.get("tool_calls", []) or []):
+            # Halt check before each tool call (matches Anthropic
+            # legacy at line 1191; the runtime uses this to short-
+            # circuit on system_refuse).
+            if should_halt is not None:
+                halt_val = should_halt()
+                if asyncio.iscoroutine(halt_val):
+                    halt_val = await halt_val
+                if halt_val:
+                    return {
+                        "thinking": "",
+                        "summary": "halted (refused)",
+                    }
+            tool = call["tool"]
+            args = call.get("args", {}) or {}
+            call_id = f"stub-call-{idx}"
+            summary_body = f"{tool}({json.dumps(dict(args))})"
+            await on_writeback(
+                kind="tool_call",
+                body=summary_body,
+                tool_call_id=call_id,
+                tool_name=tool,
+                tool_args=dict(args),
+            )
+            try:
+                result = await execute_tool(tool, dict(args))
+                content_str = (
+                    json.dumps(result)
+                    if isinstance(result, (dict, list))
+                    else str(result) if result is not None else ""
+                )
+                await on_writeback(
+                    kind="tool_result",
+                    body=content_str,
+                    tool_call_id=call_id,
+                    is_error=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await on_writeback(
+                    kind="tool_result",
+                    body=f"Error: {exc}",
+                    tool_call_id=call_id,
+                    is_error=True,
+                )
+
+        # Final agent text. The script may declare a body either as
+        # ``final_result["body"]`` (recommended for chat-shape stubs)
+        # or as ``final_result`` itself when it's a string.
+        final_body = _extract_final_body(script)
+        if final_body:
+            if on_text_delta:
+                await on_text_delta(final_body)
+            await on_writeback(kind="agent", body=final_body)
+            if on_text_end:
+                await on_text_end(committed=True)
+        else:
+            if on_text_end:
+                await on_text_end(committed=False)
+        return {
+            "thinking": final_body or "",
+            "summary": script.get("final_outcome", "success"),
+        }
+
+
+def _extract_final_body(script: dict) -> str:
+    """Pull the agent's end-of-turn text from a script. Accepts
+    either ``final_result["body"]`` (dict shape) or
+    ``final_result`` directly (string shape). Empty string when
+    neither is present."""
+    fr = script.get("final_result")
+    if isinstance(fr, dict):
+        body = fr.get("body")
+        if isinstance(body, str) and body:
+            return body
+    elif isinstance(fr, str) and fr:
+        return fr
+    return ""
 
 
 # ── Registration ──
