@@ -407,16 +407,19 @@ def _make_delete_route(app, ctx, path, cr, sc, lc, row_filter=None):
 
 
 def _make_transition_route(app, ctx, path, cr, sc, lc, ts, mn=None):
-    """Slice 7.2.e of Phase 7 (2026-04-30): per-machine, per-target
-    state-transition route. Body extracted to
-    ``termin_core.routing.crud.transition_content_handler``.
+    """v0.9.4: canonical-path state-transition route. Body extracted
+    to ``termin_core.routing.crud.transition_content_handler``.
 
-    ``mn`` is the machine_name (snake_case) the route drives.
-    Required in v0.9 — every transition route addresses one machine
-    on one content. Callers from ``register_crud_routes`` always
-    pass it; older internal callers (none currently) would not, in
-    which case the core handler falls back to the first state
-    machine on the content for backward compatibility.
+    Path shape after v0.9.4 compiler change (closes core #6 (4)):
+    ``POST /_transition/{plural}/{{machine}}/{{key}}/{{target}}``.
+    ``machine``, ``key``, and ``target`` arrive as path parameters —
+    one route per content handles every machine and every target on
+    that content. Earlier versions emitted one route per
+    (machine, target) tuple under
+    ``/api/v1/{content}/{id}/_transition/{machine_lit}/{target_lit}``
+    with the machine and target baked into the spec; the ``ts`` and
+    ``mn`` parameters carry None for v0.9.4 IRs and are kept only
+    for ABI compatibility with the route-builder loop.
     """
     from termin_core.routing import transition_content_handler
     from .fastapi_adapter import (
@@ -434,17 +437,22 @@ def _make_transition_route(app, ctx, path, cr, sc, lc, ts, mn=None):
         ctx.lookup_column_for = lambda cn: ctx._lookup_column_for_content.get(cn, "id")
 
     @app.post(path, dependencies=deps)
-    async def transition_route(request: Request, _cr=cr, _ts=ts, _mn=mn):
-        key_val = list(request.path_params.values())[0] if request.path_params else None
+    async def transition_route(request: Request, _cr=cr):
+        # The canonical path has machine/key/target as placeholders;
+        # FastAPI extracts them into request.path_params. The
+        # underscores-to-spaces translation for multi-word states
+        # (e.g. ``in_progress`` → ``"in progress"``) is done by
+        # ``transition_content_handler`` so we pass the raw value.
+        pp = request.path_params or {}
         user = ctx.get_current_user(request)
         auth = make_auth_context(user)
         termin_req = await to_termin_request(
             request,
             path_params={
                 "content": _cr,
-                "key": key_val,
-                "machine": _mn,
-                "target": _ts,
+                "key": pp.get("key", ""),
+                "machine": pp.get("machine"),
+                "target": pp.get("target", ""),
             },
             auth=auth,
         )

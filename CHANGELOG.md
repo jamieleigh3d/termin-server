@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (`_make_transition_route` aligned to canonical path shape)
+
+- **`_make_transition_route` reads `machine`, `key`, and `target`
+  from `request.path_params`** instead of from the baked-in
+  `target_state`/`machine_name` route metadata. This is the
+  server-side half of the canonical transition path shape change
+  in `termin-compiler` (closes `termin-core` #6 (4)): the IR now
+  emits one generic transition route per content
+  (`/_transition/{plural}/{{machine}}/{{key}}/{{target}}`) and
+  FastAPI extracts all four positions into `request.path_params`
+  for the handler to read.
+
+  `register_transition_routes` (the legacy top-level catch-all
+  in `transitions.py`) is unchanged. Both registrations now share
+  the same path shape, so the dual registration is benign — the
+  IR-driven per-content route binds first (more specific in
+  FastAPI's matcher) and `register_transition_routes` serves as a
+  fallback for any content without IR transition routes.
+
+  No new server tests; the change is exercised by the existing
+  transition tests in the compiler and conformance suites and by
+  `test_put_state_bypass.py`'s round-trip path. 144/144 server
+  tests still passing.
+
 ### Fixed (v0.9.4 A3b #2 — stub providers expose `.legacy` adapter)
 
 - **`StubAgentProvider.legacy`** and **`StubLlmProvider.legacy`**
