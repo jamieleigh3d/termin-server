@@ -670,10 +670,18 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
     _sm_by_content = defaultdict(list)
     for sm in ir.get("state_machines", []):
         col = sm["machine_name"]   # already snake_case in IR
+        # v0.9.4 Gap #7: each transition gate dict now also carries
+        # `entered_assignments` — the (field, cel_expression) pairs
+        # the runtime evaluates and patches atomically with the
+        # state-column update at state.transition(...) time.
         trans_dict = {
             (t["from_state"], t["to_state"]): {
                 "required_scope": t.get("required_scope", ""),
                 "condition_expr": t.get("condition_expr"),
+                "entered_assignments": tuple(
+                    tuple(pair) for pair in
+                    t.get("entered_assignments", []) or ()
+                ),
             }
             for t in sm.get("transitions", [])
         }
