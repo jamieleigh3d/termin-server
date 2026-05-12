@@ -840,6 +840,202 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                 f"[Termin] [WARN] When-rule Append failed: {_err}"
             )
 
+    async def _execute_owner_keyed_update(
+        _ctx, action: dict, source_record: dict, evctx: dict, *,
+        content_name: str, invoked_by_principal_id: str | None,
+        source_label: str,
+    ):
+        """v0.9.4 cross-content slice (B5): resolve and apply an
+        owner-keyed Update action.
+
+        Algorithm (per design doc §7.1):
+
+          1. Determine the principal id from the event context. Order:
+             explicit `invoked_by_principal_id` argument; the source
+             record's ownership field; bare anonymous as a last
+             resort.
+          2. Skip with a log warning if the principal is bare
+             anonymous (id == "anonymous"). Bare anonymous is shared
+             across callers; mutating a "shared singleton" via
+             `Update the user's X` would let any unauth caller stomp
+             the same row.
+          3. Query target via storage.query(content,
+             Eq(owner_field, principal_id), limit=1).
+          4. If a target row exists: bind it into evctx by content
+             singular, evaluate assignments, storage.update.
+          5. If no target row AND ownership has `unique`: build a
+             default-valued record from the schema, populate the
+             ownership field with the principal id, bind to evctx,
+             evaluate assignments, storage.create. The
+             default-valued record gives `max(profile.X, ...)` a
+             usable starting value (0 / "" / [] / etc.).
+          6. If no target row AND no `unique` constraint: log + skip
+             — this case shouldn't reach the runtime because the
+             analyzer's TERMIN-A104 enforces `unique` at compile
+             time. Defensive fallback only.
+        """
+        from termin_core.providers import Eq, QueryOptions
+
+        target_content = action.get("update_content", "")
+        target_owner_field = action.get("update_target_owner", "")
+        if not target_content or not target_owner_field:
+            print(
+                f"[Termin] [WARN] {source_label} owner-keyed Update "
+                f"missing update_content / update_target_owner; "
+                f"skipping. action={action!r}"
+            )
+            return
+
+        # Step 1: pick a principal id. Explicit invoked_by wins; the
+        # source record's owner field is the fallback (matches the
+        # natural semantics of "the user" inside the rule context —
+        # see design doc §12.1).
+        principal_id = invoked_by_principal_id or ""
+        if not principal_id:
+            # Find the source content's ownership field and read
+            # the source record's value.
+            for cs in ir.get("content", []):
+                if cs.get("name", {}).get("snake") != content_name:
+                    continue
+                own = cs.get("ownership") or {}
+                source_owner_field = own.get("field") or ""
+                if source_owner_field:
+                    principal_id = str(
+                        source_record.get(source_owner_field, "") or ""
+                    )
+                break
+
+        # Step 2: bare-anonymous skip. Bare anonymous would resolve
+        # to a singleton "anonymous" row that any unauth caller
+        # could stomp — the per-design §8.3 protection.
+        if not principal_id or principal_id == "anonymous":
+            print(
+                f"[Termin] [WARN] {source_label} owner-keyed Update: "
+                f"no resolvable user principal "
+                f"(principal_id={principal_id!r}); skipping. "
+                f"target={target_content!r}"
+            )
+            return
+
+        # Step 3: query for an existing target row.
+        try:
+            page = await ctx.storage.query(
+                target_content,
+                Eq(field=target_owner_field, value=principal_id),
+                QueryOptions(limit=1),
+            )
+            existing = (
+                dict(page.records[0])
+                if page.records
+                else None
+            )
+        except Exception as _q_err:
+            print(
+                f"[Termin] [WARN] {source_label} owner-keyed Update "
+                f"target lookup failed: {_q_err}"
+            )
+            return
+
+        # Step 4 / 5: build the target record (existing or
+        # default-valued) for CEL binding.
+        target_schema = None
+        for cs in ir.get("content", []):
+            if cs.get("name", {}).get("snake") == target_content:
+                target_schema = cs
+                break
+        target_singular = (
+            ctx.singular_lookup.get(target_content, target_content)
+            if hasattr(ctx, "singular_lookup")
+            else target_content
+        )
+
+        if existing:
+            target_record = existing
+        else:
+            # Build default-valued record from the schema. Each
+            # field's `defaults to` literal becomes its initial
+            # value; otherwise zero / empty-string / empty-list per
+            # business_type. Then stamp the ownership field with
+            # the principal id so the upserted row is owner-tagged.
+            if not target_schema:
+                print(
+                    f"[Termin] [WARN] {source_label} owner-keyed Update "
+                    f"target schema not found for {target_content!r}; "
+                    f"skipping upsert."
+                )
+                return
+            target_record = _build_default_record(target_schema)
+            target_record[target_owner_field] = principal_id
+
+        # Bind target into evctx by singular so CEL can read
+        # `profile.games_played` etc. Mutates a copy to keep the
+        # caller's evctx clean.
+        local_evctx = dict(evctx)
+        local_evctx[target_singular] = dict(target_record)
+
+        patch = {}
+        update_failed = False
+        for col, cel_expr in action.get("update_assignments") or ():
+            try:
+                patch[col] = ctx.expr_eval.evaluate(cel_expr, local_evctx)
+            except Exception as _eval_err:
+                print(
+                    f"[Termin] [WARN] {source_label} owner-keyed Update "
+                    f"CEL eval failed for {col!r}: {_eval_err}"
+                )
+                update_failed = True
+                break
+        if update_failed or not patch:
+            return
+
+        try:
+            if existing:
+                await ctx.storage.update(
+                    target_content, existing.get("id"), patch,
+                )
+            else:
+                # Apply patch to the default-valued record then
+                # create. The ownership field stamp + patch fields
+                # together form the create payload.
+                create_payload = dict(target_record)
+                create_payload.update(patch)
+                # Drop server-supplied keys (id, created_at) so
+                # storage.create generates them.
+                create_payload.pop("id", None)
+                await ctx.storage.create(target_content, create_payload)
+        except Exception as _wr_err:
+            print(
+                f"[Termin] [WARN] {source_label} owner-keyed Update "
+                f"storage write failed: {_wr_err}"
+            )
+
+    def _build_default_record(content_schema: dict) -> dict:
+        """Build a default-valued record from a content schema. Each
+        field gets its `defaults to` literal, or a per-business_type
+        zero value (0 for numbers, "" for text, [] for structured /
+        list, "no" for yes/no, etc.). Used by the owner-keyed Update
+        upsert path so the default-valued record can be bound into
+        CEL scope before assignment evaluation."""
+        defaults = {}
+        for f in content_schema.get("fields", []) or []:
+            name = f.get("name", "")
+            if not name:
+                continue
+            d = f.get("default", None)
+            if d is not None:
+                defaults[name] = d
+                continue
+            bt = (f.get("business_type") or "").lower()
+            if bt in ("number", "whole_number", "currency", "percentage"):
+                defaults[name] = 0
+            elif bt in ("yes_no", "boolean"):
+                defaults[name] = "no"
+            elif bt in ("list", "structured"):
+                defaults[name] = []
+            else:
+                defaults[name] = ""
+        return defaults
+
     async def run_event_handlers(db, content_name: str, trigger: str, record: dict,
                                  *, appended_entry: dict | None = None,
                                  invoked_by_principal_id: str | None = None):
@@ -918,21 +1114,24 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                                         invoked_by_principal_id=invoked_by_principal_id,
                                     )
                                 elif action.get("update_content"):
-                                    # v0.9.4 Gap #5: Update action.
-                                    # Evaluate each (column, cel_expr)
-                                    # assignment against the predicate
-                                    # context (`evctx`) and apply the
-                                    # patch via storage.update on the
-                                    # parent record. Targets the same
-                                    # record the When-rule fired on
-                                    # (sourced from `record["id"]`,
-                                    # mirroring the Append action's
-                                    # parent-record resolution path).
-                                    # CEL eval failures fail loud in
-                                    # the log — the upstream HTTP/WS
-                                    # request that triggered the rule
-                                    # has already returned by the time
-                                    # event dispatch runs.
+                                    # v0.9.4 cross-content slice (B5):
+                                    # branch on update_target_kind.
+                                    # See run_state_entered_event_handlers
+                                    # for the parallel branch.
+                                    target_kind = action.get(
+                                        "update_target_kind", "") or ""
+                                    if target_kind == "owner-keyed":
+                                        await _execute_owner_keyed_update(
+                                            ctx, action, record, evctx,
+                                            content_name=content_name,
+                                            invoked_by_principal_id=invoked_by_principal_id,
+                                            source_label="When-rule",
+                                        )
+                                        continue
+                                    # v0.9.4 Gap #5 (A3a same-record):
+                                    # target id is the source record's
+                                    # id; the patch lands on the same
+                                    # row the rule fired on.
                                     target_id = record.get("id")
                                     if not target_id:
                                         print(
@@ -1176,48 +1375,61 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                             invoked_by_principal_id=invoked_by_principal_id,
                         )
                     elif action.get("update_content"):
-                        target_id = record.get("id")
-                        if not target_id:
-                            print(
-                                f"[Termin] [WARN] State-entered When-rule "
-                                f"Update: parent record missing id; "
-                                f"skipping. content="
-                                f"{action.get('update_content')!r}"
+                        # v0.9.4 cross-content slice (B5): branch on
+                        # update_target_kind. Same-record (the A3a
+                        # default) updates the source record's id.
+                        # Owner-keyed resolves the target by
+                        # querying update_content for the row whose
+                        # update_target_owner field equals the event's
+                        # principal id, upserting on miss.
+                        target_kind = action.get(
+                            "update_target_kind", "") or ""
+                        if target_kind == "owner-keyed":
+                            await _execute_owner_keyed_update(
+                                ctx, action, record, evctx,
+                                content_name=content_name,
+                                invoked_by_principal_id=invoked_by_principal_id,
+                                source_label="State-entered When-rule",
                             )
-                            continue
-                        patch = {}
-                        update_failed = False
-                        for col, cel_expr in action.get(
-                            "update_assignments") or ():
-                            try:
-                                patch[col] = ctx.expr_eval.evaluate(
-                                    cel_expr, evctx)
-                            except Exception as _eval_err:
+                        else:
+                            target_id = record.get("id")
+                            if not target_id:
                                 print(
-                                    f"[Termin] [WARN] State-entered When-rule "
-                                    f"Update CEL eval failed for "
-                                    f"{col!r}: {_eval_err}"
+                                    f"[Termin] [WARN] State-entered "
+                                    f"When-rule Update: parent record "
+                                    f"missing id; skipping. content="
+                                    f"{action.get('update_content')!r}"
                                 )
-                                update_failed = True
-                                break
-                        if update_failed or not patch:
-                            continue
-                        # B5 will branch on update_target_kind here
-                        # to add the owner-keyed resolver. For B4
-                        # the same-record path matches the airlock
-                        # case (the When-rule's source content
-                        # equals the Update target).
-                        try:
-                            await ctx.storage.update(
-                                action["update_content"],
-                                target_id, patch,
-                            )
-                        except Exception as _upd_err:
-                            print(
-                                f"[Termin] [WARN] State-entered When-rule "
-                                f"Update storage.update failed: "
-                                f"{_upd_err}"
-                            )
+                                continue
+                            patch = {}
+                            update_failed = False
+                            for col, cel_expr in action.get(
+                                "update_assignments") or ():
+                                try:
+                                    patch[col] = ctx.expr_eval.evaluate(
+                                        cel_expr, evctx)
+                                except Exception as _eval_err:
+                                    print(
+                                        f"[Termin] [WARN] State-entered "
+                                        f"When-rule Update CEL eval "
+                                        f"failed for {col!r}: "
+                                        f"{_eval_err}"
+                                    )
+                                    update_failed = True
+                                    break
+                            if update_failed or not patch:
+                                continue
+                            try:
+                                await ctx.storage.update(
+                                    action["update_content"],
+                                    target_id, patch,
+                                )
+                            except Exception as _upd_err:
+                                print(
+                                    f"[Termin] [WARN] State-entered "
+                                    f"When-rule Update storage.update "
+                                    f"failed: {_upd_err}"
+                                )
                 await ctx.event_bus.publish({
                     "type": f"{content_name}_state_entered_handler",
                     "log_level": ev.get("log_level", "INFO"),
