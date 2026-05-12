@@ -840,6 +840,54 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                 f"[Termin] [WARN] When-rule Append failed: {_err}"
             )
 
+    def _parse_structured_fields(content_name: str, record: dict) -> dict:
+        """v0.9.4: parse JSON-text values for structured /
+        conversation fields into native dicts/lists so CEL can read
+        nested fields naturally (`session.scores.of_level` instead
+        of `parse_json(session.scores).of_level`).
+
+        SQLite stores `structured` and `conversation` field values
+        as JSON text; the storage layer hands them back as strings.
+        Without this parse, CEL hits "type does not support field
+        selection" trying to access `.of_level` on a StringType.
+
+        Schema-driven: only fields whose business_type is
+        "structured" or "conversation" are parsed — bare text
+        fields are left alone. Returns a shallow copy of `record`
+        with the parsed values; the original is unchanged.
+        """
+        if not isinstance(record, dict):
+            return record
+        # Find the schema for this content (one-shot lookup; cheap
+        # because the IR's content list is short).
+        schema = None
+        for cs in ir.get("content", []):
+            if cs.get("name", {}).get("snake") == content_name:
+                schema = cs
+                break
+        if schema is None:
+            return record
+        parseable_fields = {
+            f.get("name"): f.get("business_type", "")
+            for f in schema.get("fields", []) or []
+            if f.get("business_type") in ("structured", "conversation")
+        }
+        if not parseable_fields:
+            return record
+        out = dict(record)
+        for name, _bt in parseable_fields.items():
+            v = out.get(name)
+            if isinstance(v, str) and v:
+                try:
+                    out[name] = json.loads(v)
+                except (ValueError, TypeError):
+                    # Malformed — leave as string; the CEL eval
+                    # will fail loud at field-access time, which
+                    # is the right behavior for a serialization
+                    # bug.
+                    pass
+        return out
+
     async def _execute_owner_keyed_update(
         _ctx, action: dict, source_record: dict, evctx: dict, *,
         content_name: str, invoked_by_principal_id: str | None,
@@ -1060,6 +1108,10 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     if (appended_entry is None
                             and "appended_entry" in (ev.get("condition_expr") or "")):
                         continue
+                    # v0.9.4: parse JSON-text structured /
+                    # conversation fields so CEL can read them as
+                    # nested values (e.g. `session.scores.of_level`).
+                    record = _parse_structured_fields(content_name, record)
                     evctx = dict(record)
                     for k, v in list(record.items()):
                         parts = k.split("_")
@@ -1340,6 +1392,10 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
             # `round.points + 1` resolve. The source record is bound
             # by both the canonical singular AND its raw column
             # access shape.
+            # v0.9.4: parse JSON-text structured / conversation
+            # fields so CEL can read them as nested values
+            # (e.g. `session.scores.of_level`).
+            record = _parse_structured_fields(content_name, record)
             evctx = dict(record)
             for k, v in list(record.items()):
                 parts = k.split("_")
