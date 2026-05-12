@@ -128,6 +128,33 @@ def register_transition_routes(app, ctx: RuntimeContext):
                 ctx.storage, content, record_id, machine_name, target, user,
                 ctx.sm_lookup, ctx.terminator, ctx.event_bus,
                 expr_eval=ctx.expr_eval)
+            # v0.9.4 cross-content slice (B4): dispatch state-entered
+            # When-rules. The state engine published the entered event
+            # to the bus already; this synchronous call runs any
+            # When-rule whose source_content + trigger_state_field +
+            # trigger_state_value match the transition. The result
+            # record may carry the freshly-updated state column or be
+            # the pre-transition shape; re-fetch via storage.read to
+            # ensure the When-rule sees the post-transition record
+            # (its assignments may reference the new state).
+            handler = getattr(ctx, "run_state_entered_event_handlers", None)
+            if handler is not None:
+                try:
+                    fresh_record = (
+                        await ctx.storage.read(content, record_id) or result
+                    )
+                    invoked_by_id = (
+                        user.get("id") if isinstance(user, dict) else None
+                    )
+                    await handler(
+                        None, content, machine_name, target, fresh_record,
+                        invoked_by_principal_id=invoked_by_id,
+                    )
+                except Exception as _hdl_err:
+                    print(
+                        f"[Termin] [WARN] State-entered When-rule "
+                        f"handler dispatch failed: {_hdl_err}"
+                    )
             is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
             # Build feedback message

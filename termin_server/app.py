@@ -1107,7 +1107,129 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                             _close_bg_loop_cleanly(bg_loop)
                     threading.Thread(target=_run_compute, daemon=True).start()
 
+    async def run_state_entered_event_handlers(
+        db, content_name: str, machine_name: str, target_state: str,
+        record: dict, *, invoked_by_principal_id: str | None = None,
+    ):
+        """v0.9.4 cross-content slice (B4): dispatch state-entered
+        When-rules that match the (content, machine, state) tuple
+        the state-machine engine just transitioned a record into.
+
+        Called from the transition routes after `do_state_transition`
+        succeeds (and after the corresponding event-bus publish).
+        Action dispatch reuses the same per-action branch logic the
+        CEL-predicate path runs — Update, Append, Create, Send all
+        work from a state-entered trigger the same way they work
+        from a CEL-predicate trigger.
+        """
+        for ev in ir.get("events", []):
+            if ev.get("trigger") != "state-entered":
+                continue
+            if ev.get("source_content") != content_name:
+                continue
+            if ev.get("trigger_state_field") != machine_name:
+                continue
+            # State value comparison: compiler emits the value as
+            # authored (multi-word states keep their spaces); the
+            # transition route's target_state has already been
+            # space-normalized. Compare with whitespace tolerance.
+            event_state = ev.get("trigger_state_value", "")
+            if event_state.replace("_", " ") != target_state.replace("_", " "):
+                continue
+            # Build the predicate context — same shape as the
+            # CEL-predicate path so action CEL expressions like
+            # `round.points + 1` resolve. The source record is bound
+            # by both the canonical singular AND its raw column
+            # access shape.
+            evctx = dict(record)
+            for k, v in list(record.items()):
+                parts = k.split("_")
+                camel = parts[0] + "".join(w.capitalize() for w in parts[1:])
+                evctx[camel] = v
+            snake_singular = ctx.singular_lookup.get(content_name, "")
+            if not snake_singular:
+                snake_singular = (
+                    content_name.rstrip("s")
+                    if content_name.endswith("s")
+                    else content_name
+                )
+            prefixed = dict(evctx)
+            prefixed["updated"] = True
+            prefixed["created"] = True
+            evctx[snake_singular] = prefixed
+            try:
+                actions_to_run = list(ev.get("actions") or [])
+                if not actions_to_run and ev.get("action"):
+                    actions_to_run = [ev["action"]]
+                for action in actions_to_run:
+                    # Reuse the per-action branch logic from
+                    # run_event_handlers. For B4 scope only the
+                    # Update + Append branches are exercised by the
+                    # airlock A4 case; the others (Create, Send) are
+                    # included by symmetry — a future test will land
+                    # them.
+                    if action.get("append_field"):
+                        await _execute_when_rule_append(
+                            db, ev, action, record,
+                            evctx=evctx,
+                            appended_entry=None,
+                            invoked_by_principal_id=invoked_by_principal_id,
+                        )
+                    elif action.get("update_content"):
+                        target_id = record.get("id")
+                        if not target_id:
+                            print(
+                                f"[Termin] [WARN] State-entered When-rule "
+                                f"Update: parent record missing id; "
+                                f"skipping. content="
+                                f"{action.get('update_content')!r}"
+                            )
+                            continue
+                        patch = {}
+                        update_failed = False
+                        for col, cel_expr in action.get(
+                            "update_assignments") or ():
+                            try:
+                                patch[col] = ctx.expr_eval.evaluate(
+                                    cel_expr, evctx)
+                            except Exception as _eval_err:
+                                print(
+                                    f"[Termin] [WARN] State-entered When-rule "
+                                    f"Update CEL eval failed for "
+                                    f"{col!r}: {_eval_err}"
+                                )
+                                update_failed = True
+                                break
+                        if update_failed or not patch:
+                            continue
+                        # B5 will branch on update_target_kind here
+                        # to add the owner-keyed resolver. For B4
+                        # the same-record path matches the airlock
+                        # case (the When-rule's source content
+                        # equals the Update target).
+                        try:
+                            await ctx.storage.update(
+                                action["update_content"],
+                                target_id, patch,
+                            )
+                        except Exception as _upd_err:
+                            print(
+                                f"[Termin] [WARN] State-entered When-rule "
+                                f"Update storage.update failed: "
+                                f"{_upd_err}"
+                            )
+                await ctx.event_bus.publish({
+                    "type": f"{content_name}_state_entered_handler",
+                    "log_level": ev.get("log_level", "INFO"),
+                })
+            except Exception as _ev_err:
+                print(
+                    f"[Termin] [WARN] State-entered When-rule handler "
+                    f"error: {_ev_err}"
+                )
+
     ctx.run_event_handlers = run_event_handlers
+    ctx.run_state_entered_event_handlers = run_state_entered_event_handlers
     ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None, invoked_by=None, triggering_entry=None: \
         execute_compute(ctx, comp, record or {}, content_name, main_loop, invoked_by=invoked_by, triggering_entry=triggering_entry)
 

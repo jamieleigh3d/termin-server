@@ -446,17 +446,48 @@ def _make_transition_route(app, ctx, path, cr, sc, lc, ts, mn=None):
         pp = request.path_params or {}
         user = ctx.get_current_user(request)
         auth = make_auth_context(user)
+        machine_name = pp.get("machine") or ""
+        target_state_raw = pp.get("target", "")
+        target_state = target_state_raw.replace("_", " ")
+        record_key = pp.get("key", "")
         termin_req = await to_termin_request(
             request,
             path_params={
                 "content": _cr,
-                "key": pp.get("key", ""),
-                "machine": pp.get("machine"),
-                "target": pp.get("target", ""),
+                "key": record_key,
+                "machine": machine_name,
+                "target": target_state_raw,
             },
             auth=auth,
         )
         response = await transition_content_handler(termin_req, ctx)
+        # v0.9.4 cross-content slice (B4): on a successful transition,
+        # dispatch matching state-entered When-rules. Same hook the
+        # legacy `register_transition_routes` path runs — both
+        # registrations need it because either may bind the route
+        # depending on FastAPI's matcher precedence. Idempotent
+        # because the When-rule itself fires at most once per
+        # (record, target_state) entry by construction.
+        if 200 <= response.status_code < 300:
+            handler = getattr(ctx, "run_state_entered_event_handlers", None)
+            if handler is not None and machine_name and target_state:
+                try:
+                    fresh_record = await ctx.storage.read(_cr, record_key)
+                    if fresh_record:
+                        invoked_by_id = (
+                            user.get("id") if isinstance(user, dict) else None
+                        )
+                        await handler(
+                            None, _cr, machine_name, target_state,
+                            fresh_record,
+                            invoked_by_principal_id=invoked_by_id,
+                        )
+                except Exception as _hdl_err:
+                    print(
+                        f"[Termin] [WARN] State-entered When-rule "
+                        f"handler dispatch failed (per-route): "
+                        f"{_hdl_err}"
+                    )
         return to_fastapi_response(response)
 
 
