@@ -78,6 +78,25 @@ def register_page_routes(app, ctx: RuntimeContext):
         emitted_slugs.add(slug)
         reqs = extract_page_reqs(page)
 
+        # v0.9.4 Phase 2: detail-page binding. When PageEntry carries
+        # a non-empty record_binding, register the route as
+        # `/<slug>/{id}` instead of `/<slug>`. The handler fetches
+        # the record server-side (404 if missing, ownership-scoped),
+        # then renders the page through the same template path —
+        # bound-record propagation happens client-side: the
+        # React component reads the {id} from the URL and fetches
+        # via /api/v1/<plural>/<id>. The v0.10 bound_data pass will
+        # thread the record dict into the IR fragments natively;
+        # for v0.9.4 the URL-driven fetch keeps the runtime change
+        # to one new handler.
+        record_binding = page.get("record_binding") or ""
+        if record_binding:
+            _register_detail_page_get(
+                app, ctx, page, slug, record_binding,
+                page_templates, base_template, compute_js,
+            )
+            continue  # detail pages don't have form posts
+
         _register_page_get(app, ctx, page, slug, reqs, page_templates,
                            base_template, compute_js)
 
@@ -226,6 +245,125 @@ def _register_page_get(app, ctx, page, slug, page_reqs, page_templates,
             return base_template.render(content=content_html, **template_ctx)
         finally:
             await db.close()
+
+
+def _register_detail_page_get(app, ctx, page, slug, record_binding,
+                              page_templates, base_template, compute_js):
+    """v0.9.4 Phase 2 — register a detail-page route at /<slug>/{id}.
+
+    Differences from a regular page route:
+      - Path includes the {id} segment so each request names one
+        record of `record_binding` (the bound plural).
+      - The handler fetches the record before rendering so it can
+        return 404 cleanly when the id doesn't match (and so the
+        404 happens server-side rather than after the React bundle
+        has hydrated and failed its own /api/v1/<plural>/<id>
+        fetch).
+      - Ownership: if the bound content declares `is owned by
+        <field>`, the handler verifies the record's owner field
+        matches the caller's principal id. A mismatch returns 404
+        (same surface as missing, so ownership doesn't leak
+        existence — same pattern as the append route in routes.py
+        and the auto-CRUD GET handler).
+      - The record dict itself is NOT propagated to the client in
+        v0.9.4 — the React component reads the {id} from
+        `window.location.pathname` and fetches /api/v1/<plural>/<id>
+        for the full record. The v0.10 bound_data pass will thread
+        the record into IR fragments natively; this v0.9.4 handler
+        keeps the server-side change minimal.
+    """
+    @app.get(f"/{slug}/{{id}}", response_class=HTMLResponse)
+    async def detail_route(
+        request: Request, id: str, _pg=page, _sl=slug,
+        _binding=record_binding,
+    ):
+        if page_should_use_shell(ctx):
+            return await render_shell_response(
+                ctx, request, f"/{_sl}/{id}",
+            )
+
+        user = ctx.get_current_user(request)
+
+        # Fetch the bound record — returns None if missing.
+        record = await ctx.storage.read(_binding, id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        # Ownership filter (same shape as routes.py:611-625) — 404
+        # rather than 403 so ownership doesn't leak existence.
+        owner_field = None
+        if hasattr(ctx, "_owner_field_for_content"):
+            owner_field = ctx._owner_field_for_content.get(_binding)
+        if owner_field:
+            user_id = (user or {}).get("id") if user else None
+            if not user_id and isinstance(user, dict):
+                the_user = user.get("the_user") or {}
+                user_id = the_user.get("id")
+            principal = user.get("Principal") if user else None
+            if not user_id and principal is not None:
+                user_id = getattr(principal, "id", None)
+            if owner_field in record and record.get(owner_field) != user_id:
+                raise HTTPException(status_code=404, detail="Not found")
+
+        # Build template_ctx the same way the regular page route
+        # does — the page template is shared. Defensive: minimal
+        # data sources (the detail page binds one record, not a
+        # list; the IR-level sources are still passed through for
+        # any non-bound directive children).
+        import datetime
+        from termin_core.routing import build_the_user_for_cel
+        from termin_server.fastapi_adapter import make_auth_context
+
+        cel_ctx = {
+            "the_user": build_the_user_for_cel(make_auth_context(user)),
+            "now": datetime.datetime.now(
+                datetime.timezone.utc,
+            ).isoformat().replace("+00:00", "Z"),
+            "today": datetime.date.today().isoformat(),
+        }
+
+        def _termin_eval(expression):
+            try:
+                return ctx.expr_eval.evaluate(expression, cel_ctx)
+            except Exception:
+                return "..."
+
+        principal = user.get("Principal")
+        is_anonymous = (
+            principal.is_anonymous if principal is not None
+            else str(user.get("role", "")).lower() == "anonymous"
+        )
+
+        template_ctx = {
+            "page_title": _pg["name"],
+            "current_role": user["role"],
+            "current_user_name": user["profile"]["DisplayName"],
+            "is_anonymous": is_anonymous,
+            "user_profile_json": json.dumps(user["profile"]),
+            "roles": list(ctx.roles.keys()),
+            "q": "",
+            "termin_compute_js": compute_js,
+            "_sm_transitions": {},
+            "_sm_transitions_by_content": {},
+            "_sm_transitions_by_machine": {},
+            "user_scopes": set(user.get("scopes", [])),
+            "termin_eval": _termin_eval,
+            "flash_msg": None,
+            "flash_style": "toast",
+            "flash_level": "success",
+            "flash_dismiss": None,
+            # v0.9.4 Phase 2: the bound record. Templates and
+            # contracts may read this; the React component on the
+            # client also re-fetches via /api/v1/<binding>/{id} so
+            # changes-after-render reflect.
+            "bound_record": record,
+            "bound_record_id": id,
+            "items": [record],  # legacy compat for templates that
+                                # iterate items even on detail pages
+        }
+
+        content_html = page_templates[_sl].render(**template_ctx)
+        return base_template.render(content=content_html, **template_ctx)
 
 
 def _register_form_post(app, ctx, page, slug, reqs):
