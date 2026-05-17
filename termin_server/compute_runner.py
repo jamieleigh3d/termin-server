@@ -788,9 +788,15 @@ async def _execute_agent_compute(ctx: RuntimeContext, comp: dict, record: dict,
                 # Phase 2.x (d): transitions go through ctx.storage
                 # for atomic CAS — same path as the human transition
                 # endpoint.
+                # scope_for_content_verb returns a single scope string
+                # (or None) — wrap in a single-element list, not
+                # list(str) (which would explode into per-character
+                # entries and silently fail any downstream scope check).
+                _update_scope = ctx.scope_for_content_verb(cname, "update")
+                _service_scopes = [_update_scope] if _update_scope else []
                 result = await do_state_transition(
                     ctx.storage, cname, rid, machine, target,
-                    {"role": "service", "scopes": list(ctx.scope_for_content_verb(cname, "update") or [])},
+                    {"role": "service", "scopes": _service_scopes},
                     ctx.sm_lookup, ctx.terminator, ctx.event_bus,
                     expr_eval=ctx.expr_eval)
                 return result
