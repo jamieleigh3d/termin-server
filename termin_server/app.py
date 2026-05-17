@@ -1616,8 +1616,178 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     f"error: {_ev_err}"
                 )
 
+    async def run_compute_invoked_event_handlers(
+        db, compute_name: str, args: dict, result, source_content: str,
+        source_record: dict, *, invoked_by_principal_id: str | None = None,
+    ):
+        """v0.9.4 Phase 3 C3d — dispatch compute-invoked When-rules.
+
+        Called from ``_execute_cel_compute`` (and eventually the
+        llm/ai-agent paths) after the compute body has evaluated
+        successfully. The compute's result has already been returned
+        to its caller; failures inside any individual When-rule must
+        NOT propagate back up (the caller — ARIA, an HTTP trigger,
+        an event subscriber — is done waiting). Log + skip per the
+        state-entered precedent.
+
+        Args:
+            db: aiosqlite connection (passed through for legacy Update
+                paths that take it; the storage Protocol path uses
+                ``ctx.storage`` directly).
+            compute_name: snake_case name of the compute that just
+                completed. The dispatcher matches ``trigger_compute``
+                against this.
+            args: the input mapping the compute received — the
+                source-of-truth for ``args.X`` references in the
+                CEL filter and action assignments.
+            result: the compute body's evaluated output (whatever
+                value the CEL expression produced). Bound as
+                ``result`` in the event context.
+            source_content: snake content-name the compute is scoped
+                to (the Transform/Reduce input content), or "" when
+                the compute has no single source content. Used to
+                bind the source record under its singular name and
+                to anchor same-record Update targets.
+            source_record: the record the compute ran on. For
+                same-record Update actions, this record's ``id``
+                becomes the target. Empty dict when no source record
+                exists.
+            invoked_by_principal_id: upstream principal who caused
+                this invocation (propagated through cascade chains).
+        """
+        # Build the singular alias for the source content so source
+        # CEL can write `round.field` style references. Falls back
+        # to the trailing-s strip when singular_lookup is missing.
+        if source_content:
+            snake_singular = ctx.singular_lookup.get(source_content, "")
+            if not snake_singular:
+                snake_singular = (
+                    source_content.rstrip("s")
+                    if source_content.endswith("s")
+                    else source_content
+                )
+        else:
+            snake_singular = ""
+
+        # Event context: same shape as state-entered's evctx so the
+        # action branches (Update / Append / Transition) can reuse
+        # CEL eval contracts.
+        evctx: dict = {
+            "args": dict(args) if isinstance(args, dict) else {},
+            "result": result,
+        }
+        if isinstance(source_record, dict):
+            for k, v in source_record.items():
+                # Flat field bindings for back-compat with state-entered
+                # action CEL patterns (e.g. `round.points` works
+                # because we also bind the singular below).
+                evctx[k] = v
+            if snake_singular:
+                evctx[snake_singular] = dict(source_record)
+
+        for ev in ir.get("events", []):
+            if ev.get("trigger") != "compute-invoked":
+                continue
+            if ev.get("trigger_compute") != compute_name:
+                continue
+            # Filter CEL: empty filter means take-everything.
+            filter_cel = ev.get("trigger_compute_filter", "") or ""
+            if filter_cel:
+                try:
+                    filter_result = ctx.expr_eval.evaluate(
+                        filter_cel, evctx,
+                    )
+                except Exception as _filt_err:
+                    print(
+                        f"[Termin] [WARN] Compute-invoked When-rule "
+                        f"filter CEL eval failed for compute "
+                        f"{compute_name!r} filter "
+                        f"{filter_cel!r}: {_filt_err}"
+                    )
+                    continue
+                if not filter_result:
+                    continue
+            # Run the action body. Mirrors the state-entered branch
+            # logic — Update is the v0.9.4 scope; Transition/Append
+            # fall through to the same dispatch surface.
+            try:
+                actions_to_run = list(ev.get("actions") or [])
+                if not actions_to_run and ev.get("action"):
+                    actions_to_run = [ev["action"]]
+                for action in actions_to_run:
+                    if action.get("update_content"):
+                        target_kind = action.get(
+                            "update_target_kind", "") or ""
+                        if target_kind == "owner-keyed":
+                            await _execute_owner_keyed_update(
+                                ctx, action, source_record, evctx,
+                                content_name=source_content,
+                                invoked_by_principal_id=(
+                                    invoked_by_principal_id
+                                ),
+                                source_label=(
+                                    "Compute-invoked When-rule"
+                                ),
+                            )
+                            continue
+                        target_id = (
+                            source_record.get("id")
+                            if isinstance(source_record, dict)
+                            else None
+                        )
+                        if not target_id:
+                            print(
+                                f"[Termin] [WARN] Compute-invoked "
+                                f"When-rule Update: source record "
+                                f"has no id; skipping. compute="
+                                f"{compute_name!r} content="
+                                f"{action.get('update_content')!r}"
+                            )
+                            continue
+                        patch = {}
+                        update_failed = False
+                        for col, cel_expr in action.get(
+                            "update_assignments") or ():
+                            try:
+                                patch[col] = ctx.expr_eval.evaluate(
+                                    cel_expr, evctx)
+                            except Exception as _eval_err:
+                                print(
+                                    f"[Termin] [WARN] Compute-invoked "
+                                    f"When-rule Update CEL eval failed "
+                                    f"for {col!r}: {_eval_err}"
+                                )
+                                update_failed = True
+                                break
+                        if update_failed or not patch:
+                            continue
+                        try:
+                            await ctx.storage.update(
+                                action["update_content"],
+                                target_id, patch,
+                            )
+                        except Exception as _upd_err:
+                            print(
+                                f"[Termin] [WARN] Compute-invoked "
+                                f"When-rule Update storage.update "
+                                f"failed: {_upd_err}"
+                            )
+                await ctx.event_bus.publish({
+                    "type": f"{compute_name}_compute_invoked_handler",
+                    "log_level": ev.get("log_level", "INFO"),
+                })
+            except Exception as _ev_err:
+                print(
+                    f"[Termin] [WARN] Compute-invoked When-rule "
+                    f"handler error for compute {compute_name!r}: "
+                    f"{_ev_err}"
+                )
+
     ctx.run_event_handlers = run_event_handlers
     ctx.run_state_entered_event_handlers = run_state_entered_event_handlers
+    ctx.run_compute_invoked_event_handlers = (
+        run_compute_invoked_event_handlers
+    )
     ctx.execute_compute = lambda comp, record=None, content_name="", main_loop=None, invoked_by=None, triggering_entry=None: \
         execute_compute(ctx, comp, record or {}, content_name, main_loop, invoked_by=invoked_by, triggering_entry=triggering_entry)
 

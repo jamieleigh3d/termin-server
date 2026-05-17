@@ -377,6 +377,13 @@ async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
             "ExecutionId": invocation_id,
             "StartedAt": started_str,
         },
+        # v0.9.4 Phase 3 C3d: bind `args` so the compute body AND
+        # downstream compute-invoked When-rule filters can both
+        # reference the input mapping the same way. Without this,
+        # bodies like `{"marker": args.marker}` would fail at eval
+        # time and the matching `When test_tool called with
+        # \`args.marker == X\`:` filter would silently miss too.
+        "args": dict(record) if isinstance(record, dict) else {},
     }
     if isinstance(record, dict):
         eval_ctx.update(record)
@@ -384,7 +391,7 @@ async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
             eval_ctx[content_name] = record
 
     try:
-        ctx.expr_eval.evaluate(cel_body, eval_ctx)
+        result = ctx.expr_eval.evaluate(cel_body, eval_ctx)
         completed = _dt.datetime.now(_dt.timezone.utc)
         await write_audit_trace(
             ctx, comp, invocation_id=invocation_id, trigger="manual",
@@ -395,6 +402,35 @@ async def _execute_cel_compute(ctx: RuntimeContext, comp: dict, record: dict,
             trace_data={"compute_type": "cel", "cel": cel_body},
             invoked_by=invoked_by,
         )
+        # v0.9.4 Phase 3 C3d: emit the synthetic
+        # ``<compute>.invoked`` event AFTER the audit trace lands.
+        # Per-rule failures must not propagate — the dispatcher
+        # logs and swallows internally. Best-effort: if the
+        # dispatcher isn't wired (alternate runtime), the compute
+        # still completes normally.
+        dispatcher = getattr(
+            ctx, "run_compute_invoked_event_handlers", None,
+        )
+        if dispatcher is not None:
+            invoked_by_id = ""
+            if isinstance(invoked_by, dict):
+                invoked_by_id = str(invoked_by.get("id", "") or "")
+            elif invoked_by is not None:
+                invoked_by_id = str(invoked_by)
+            try:
+                await dispatcher(
+                    None, comp["name"]["snake"],
+                    dict(record) if isinstance(record, dict) else {},
+                    result, content_name,
+                    dict(record) if isinstance(record, dict) else {},
+                    invoked_by_principal_id=invoked_by_id,
+                )
+            except Exception as _dispatch_err:
+                print(
+                    f"[Termin] [WARN] Compute-invoked dispatcher "
+                    f"raised for compute {comp_name!r}: "
+                    f"{_dispatch_err}"
+                )
     except Exception as e:
         completed = _dt.datetime.now(_dt.timezone.utc)
         await write_audit_trace(
