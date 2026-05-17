@@ -1423,6 +1423,126 @@ def create_termin_app(ir_json: str, db_path: str = None, seed_data: dict = None,
                     # airlock A4 case; the others (Create, Send) are
                     # included by symmetry — a future test will land
                     # them.
+                    if action.get("transition_content"):
+                        # v0.9.4 Phase 3 C1: Transition action verb.
+                        # Re-uses do_state_transition (the same path
+                        # the HTTP /_transition/<plural>/<field>/{id}/<target>
+                        # route hits), which atomically applies the
+                        # state-column write AND publishes the entered
+                        # event. The entered event cascades back into
+                        # this dispatcher via the explicit
+                        # run_state_entered_event_handlers call below
+                        # (the cascade is intentional — chained
+                        # transitions are the C2 airlock use case).
+                        from termin_core.state.machine import (
+                            do_state_transition as _do_st,
+                        )
+                        target_content = action.get(
+                            "transition_content", "")
+                        target_field = action.get(
+                            "transition_field", "")
+                        target_state = action.get(
+                            "transition_target", "")
+                        target_id = record.get("id")
+                        if (not target_content or not target_field
+                                or not target_state or not target_id):
+                            print(
+                                f"[Termin] [WARN] State-entered "
+                                f"When-rule Transition: missing "
+                                f"required slot (content="
+                                f"{target_content!r} field="
+                                f"{target_field!r} state="
+                                f"{target_state!r} id="
+                                f"{target_id!r}); skipping"
+                            )
+                            continue
+                        # Synthesize a user dict for the transition.
+                        # The state-machine engine checks the
+                        # transition's required scope (from the
+                        # `if the user has "X"` clause) against
+                        # user["scopes"]. For system-driven
+                        # transitions from a When-rule body, we
+                        # collect every scope the target state
+                        # machine references and pass them all —
+                        # the analyzer (TERMIN-A123) already
+                        # validated the transition is declared, so
+                        # this is fail-open at the runtime layer
+                        # but fail-closed at compile time.
+                        sm_scopes: set[str] = set()
+                        for sm in (ctx.sm_lookup.get(target_content)
+                                   or []):
+                            if sm.get("machine_name") != target_field:
+                                continue
+                            for gate in (
+                                sm.get("transitions") or {}
+                            ).values():
+                                if isinstance(gate, dict):
+                                    s = gate.get("required_scope", "")
+                                else:
+                                    s = gate or ""
+                                if s:
+                                    sm_scopes.add(s)
+                        # Also include the content-update scope as a
+                        # fallback. scope_for_content_verb returns a
+                        # single scope string (or None) — wrap in
+                        # a single-element list, not list(str)
+                        # (which would explode into per-character
+                        # entries).
+                        update_scope = ctx.scope_for_content_verb(
+                            target_content, "update",
+                        )
+                        if update_scope:
+                            sm_scopes.add(update_scope)
+                        service_user = {
+                            "role": "service",
+                            "scopes": list(sm_scopes),
+                            "id": invoked_by_principal_id or "",
+                        }
+                        try:
+                            await _do_st(
+                                ctx.storage, target_content, target_id,
+                                target_field, target_state,
+                                service_user, ctx.sm_lookup,
+                                ctx.terminator, ctx.event_bus,
+                                expr_eval=ctx.expr_eval,
+                            )
+                            # Cascade: the transition just published
+                            # an entered event. Run any matching
+                            # When-rules. The recursion guard at the
+                            # dispatcher level (existing for B4)
+                            # protects against runaway chains.
+                            try:
+                                fresh = (
+                                    await ctx.storage.read(
+                                        target_content, target_id,
+                                    ) or {}
+                                )
+                                await run_state_entered_event_handlers(
+                                    db, target_content, target_field,
+                                    target_state, fresh,
+                                    invoked_by_principal_id=(
+                                        invoked_by_principal_id
+                                    ),
+                                )
+                            except Exception as _cascade_err:
+                                print(
+                                    f"[Termin] [WARN] Transition "
+                                    f"cascade dispatch failed: "
+                                    f"{_cascade_err}"
+                                )
+                        except Exception as _trans_err:
+                            # The transition may legitimately fail
+                            # (target state isn't reachable from
+                            # current state, scope missing, etc.).
+                            # Log and skip — stale-fire suppression
+                            # per design doc §5b.5.
+                            print(
+                                f"[Termin] [INFO] State-entered "
+                                f"When-rule Transition: silently "
+                                f"skipping {target_content!r}.{target_field!r} "
+                                f"-> {target_state!r}: {_trans_err}"
+                            )
+                        continue
                     if action.get("append_field"):
                         await _execute_when_rule_append(
                             db, ev, action, record,
